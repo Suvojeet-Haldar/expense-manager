@@ -1,0 +1,63 @@
+# git init
+# cat > .gitignore <<'GITIGNORE'
+# # Python
+# __pycache__/
+# *.pyc
+# *.pyo
+# *.pyd
+# venv/
+# env/
+# .Python
+# pip-wheel-metadata/
+# *.egg-info/
+
+# # Editor / OS
+# .vscode/
+# .idea/
+# .DS_Store
+
+# # env
+# .env
+# .env.* 
+# secrets.json
+
+# # Streamlit / Jupyter
+# .streamlit/
+# .ipynb_checkpoints/
+
+# # logs
+# *.log
+
+# GITIGNORE
+# git add .gitignore
+# git commit -m "chore: add .gitignore"
+
+cat > .gitignore <<'GITIGNORE'
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+.Python
+pip-wheel-metadata/
+*.egg-info/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# env
+.env
+.env.* 
+secrets.json
+
+# Streamlit / Jupyter
+.streamlit/
+.ipynb_checkpoints/
+
+# logs
+*.log
+GITIGNORE
