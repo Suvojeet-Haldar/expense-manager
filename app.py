@@ -2,145 +2,238 @@
 import time
 import json
 import os
+from datetime import datetime
+import time as time_module
 import streamlit as st
 import streamlit.components.v1 as components
+from pymongo import MongoClient
 
-st.set_page_config(page_title="Live incrementing variables", layout="centered")
+st.set_page_config(page_title="Live incrementing variables (Mongo local)", layout="centered")
 
-# ---------- defaults ----------
+# ---------- defaults & config ----------
 DEFAULT_CONFIG = {
     "VAR_NAMES": ["Var A", "Var B", "Var C", "Var D", "Var E"],
     "START_VALUES": [0.0, 10.5, 25.0, -5.0, 100.0],
-    "INCREMENTS": [0.1, 0.5, 0.05, 1.0, -0.2],
-    "UPDATES_PER_SECOND": 60,
+    "INCREMENTS": [0.1, 0.1, 0.1, 0.1, 0.1],  # default same increment-rate for now
+    "UPDATES_PER_SECOND": 10,
     "DECIMALS": 4
 }
 CONFIG_PATH = "config.json"
 
-
-def safe_rerun():
-    """Trigger a rerun across Streamlit versions."""
-    try:
-        st.rerun()  # modern
-    except Exception:
-        try:
-            st.experimental_rerun()  # older
-        except Exception:
-            st.stop()
-
-
-# ---------- safe loader ----------
 def load_config(path=CONFIG_PATH):
-    """Load config.json silently. Return validated config dict and optional error message."""
-    if not os.path.exists(path):
-        return DEFAULT_CONFIG.copy(), f"Config file '{path}' not found — using defaults."
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        return DEFAULT_CONFIG.copy(), f"Error reading '{path}': {e}. Using defaults."
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not all(k in data for k in ("VAR_NAMES", "START_VALUES", "INCREMENTS")):
+                return DEFAULT_CONFIG.copy(), "config.json missing keys; using defaults."
+            return data, None
+        except Exception as e:
+            return DEFAULT_CONFIG.copy(), f"Error reading config.json: {e}. Using defaults."
+    else:
+        return DEFAULT_CONFIG.copy(), None
 
-    cfg = {}
-    errors = []
+cfg, cfg_err = load_config()
 
-    for key in ("VAR_NAMES", "START_VALUES", "INCREMENTS"):
-        if key not in data or not isinstance(data[key], list):
-            errors.append(f"Missing/invalid '{key}' (must be a list). Reverting to defaults.")
-            cfg[key] = DEFAULT_CONFIG[key]
-        else:
-            cfg[key] = data[key]
-
-    cfg["UPDATES_PER_SECOND"] = data.get("UPDATES_PER_SECOND", DEFAULT_CONFIG["UPDATES_PER_SECOND"])
-    cfg["DECIMALS"] = data.get("DECIMALS", DEFAULT_CONFIG["DECIMALS"])
-
-    if not (len(cfg["VAR_NAMES"]) == len(cfg["START_VALUES"]) == len(cfg["INCREMENTS"]) == 5):
-        return DEFAULT_CONFIG.copy(), "VAR_NAMES/START_VALUES/INCREMENTS must each have exactly 5 items. Reverting to defaults."
-
-    try:
-        cfg["START_VALUES"] = [float(x) for x in cfg["START_VALUES"]]
-        cfg["INCREMENTS"] = [float(x) for x in cfg["INCREMENTS"]]
-    except Exception:
-        return DEFAULT_CONFIG.copy(), "START_VALUES and INCREMENTS must be numeric. Using defaults."
-
-    try:
-        cfg["UPDATES_PER_SECOND"] = int(cfg["UPDATES_PER_SECOND"])
-    except Exception:
-        cfg["UPDATES_PER_SECOND"] = DEFAULT_CONFIG["UPDATES_PER_SECOND"]
-
-    try:
-        cfg["DECIMALS"] = int(cfg["DECIMALS"])
-    except Exception:
-        cfg["DECIMALS"] = DEFAULT_CONFIG["DECIMALS"]
-
-    err_msg = " ".join(errors) if errors else None
-    return cfg, err_msg
-
-
-# ---------- load & keep in session_state ----------
-if "config" not in st.session_state:
-    cfg, cfg_err = load_config()
-    st.session_state.config = cfg
-    st.session_state.config_error = cfg_err
-else:
-    _, cfg_err = load_config()
-    st.session_state.config_error = cfg_err
-
-cfg = st.session_state.config
 VAR_NAMES = cfg["VAR_NAMES"]
-START_VALUES = cfg["START_VALUES"]
-INCREMENTS = cfg["INCREMENTS"]
-UPDATES_PER_SECOND = cfg["UPDATES_PER_SECOND"]
-DECIMALS = cfg["DECIMALS"]
+START_VALUES = [float(x) for x in cfg["START_VALUES"]]
+INCREMENTS = [float(x) for x in cfg["INCREMENTS"]]
+UPDATES_PER_SECOND = int(cfg.get("UPDATES_PER_SECOND", DEFAULT_CONFIG["UPDATES_PER_SECOND"]))
+DECIMALS = int(cfg.get("DECIMALS", DEFAULT_CONFIG["DECIMALS"]))
 
 if not (len(VAR_NAMES) == len(START_VALUES) == len(INCREMENTS) == 5):
-    st.error("Configuration arrays must each contain exactly 5 items. Fix config.json.")
+    st.error("VAR_NAMES, START_VALUES and INCREMENTS must each have exactly 5 items. Fix config.json.")
     st.stop()
 
-# Baseline for live increments
-if "base_values" not in st.session_state or "last_timestamp" not in st.session_state:
-    st.session_state.base_values = START_VALUES.copy()
-    st.session_state.last_timestamp = time.time()
+# ---------- MongoDB (local) ----------
+MONGO_URI = "mongodb://localhost:27017/"
+DB_NAME = "live_vars_db"
+COLLECTION_NAME = "state"
 
-# UI state
-st.session_state.setdefault("subtract_select", VAR_NAMES[0])
-st.session_state.setdefault("subtract_amt", 0.0)
-st.session_state.setdefault("last_action_msg", "")
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+col = db[COLLECTION_NAME]
 
-# Header
-st.title("Live incrementing variables")
-st.caption("Config is loaded from local file (hidden). Use 'Reload config' to reapply changes.")
+STATE_DOC_ID = "live_state"  # fixed _id for single-state document
 
-if st.session_state.config_error:
-    st.warning("Config warning: " + (st.session_state.config_error or "Unknown issue"))
+def to_naive(dt):
+    """
+    Normalize dt to a naive UTC datetime (no tzinfo).
+    Accepts datetime or ISO-format string. If parsing fails, returns current UTC now (naive).
+    """
+    if dt is None:
+        return datetime.utcnow()
+    if isinstance(dt, str):
+        try:
+            parsed = datetime.fromisoformat(dt)
+            dt = parsed
+        except Exception:
+            try:
+                # fallback: try removing Z and parse
+                dt = datetime.fromisoformat(dt.replace("Z", ""))
+            except Exception:
+                return datetime.utcnow()
+    # dt is datetime
+    if getattr(dt, "tzinfo", None) is not None:
+        # convert to UTC naive
+        try:
+            utc = dt.astimezone().utcfromtimestamp(dt.timestamp())
+        except Exception:
+            # simpler: convert by timestamp
+            utc = datetime.utcfromtimestamp(dt.timestamp())
+        # utc is naive (from utcfromtimestamp)
+        return utc
+    else:
+        # already naive, assume it's UTC
+        return dt
 
-if st.button("Reload config from file"):
-    new_cfg, err = load_config()
-    st.session_state.config = new_cfg
-    st.session_state.config_error = err
-    st.session_state.base_values = st.session_state.config["START_VALUES"].copy()
-    st.session_state.last_timestamp = time.time()
-    # keep selection valid after reload
-    if st.session_state.subtract_select not in st.session_state.config["VAR_NAMES"]:
-        st.session_state.subtract_select = st.session_state.config["VAR_NAMES"][0]
-    safe_rerun()
+def ensure_state_document():
+    """Ensure a single state document exists in DB with base_values, increments and last_timestamp (naive UTC)."""
+    doc = col.find_one({"_id": STATE_DOC_ID})
+    if doc is None:
+        now = datetime.utcnow()  # naive UTC
+        doc = {
+            "_id": STATE_DOC_ID,
+            "base_values": START_VALUES.copy(),
+            "increments": INCREMENTS.copy(),
+            "last_timestamp": now
+        }
+        col.insert_one(doc)
+    return doc
 
-# Compute snapshot at render
-now = time.time()
-elapsed = now - st.session_state.last_timestamp
-current_values = [base + inc * elapsed for base, inc in zip(st.session_state.base_values, INCREMENTS)]
+def get_state_doc():
+    """Fetch latest state doc from DB (returns dict)."""
+    return col.find_one({"_id": STATE_DOC_ID})
 
-# === LIVE DISPLAY (TOP) ===
-pause = st.checkbox("Pause live updates (client-side)", value=False)
-st.subheader("Live Variables")
+def compute_current_values(base_values, increments, last_timestamp, at_time=None):
+    """Return list of current values given base_values, increments, and last_timestamp.
+       last_timestamp and at_time are treated as naive UTC datetimes.
+    """
+    if at_time is None:
+        at_time = datetime.utcnow()
+    # normalize to naive UTC
+    last_ts = to_naive(last_timestamp)
+    at_ts = to_naive(at_time)
+    elapsed = (at_ts - last_ts).total_seconds()
+    return [b + inc * elapsed for b, inc in zip(base_values, increments)]
 
+# ---------- Optimized subtract: fast path (no DB read) then fallback ----------
+def subtract_optimized(index, amount, max_retries=8, retry_delay=0.05):
+    """
+    Fast-path subtract using local rendered snapshot. If DB last_timestamp unchanged, update succeeds.
+    If fails due to concurrent update, fallback to read-and-retry loop.
+    Returns (success:bool, message:str).
+    """
+    # --- Fast path using local snapshot ---
+    now = datetime.utcnow()
+    render_time = to_naive(st.session_state.get("render_time", st.session_state.last_timestamp))
+    current_rendered = st.session_state.get("current_values_rendered", compute_current_values(
+        st.session_state.base_values, st.session_state.increments, st.session_state.last_timestamp, at_time=render_time))
+    elapsed_since_render = (now - render_time).total_seconds()
+    current_now = [val + inc * elapsed_since_render for val, inc in zip(current_rendered, st.session_state.increments)]
+
+    new_bases = current_now.copy()
+    new_bases[index] = new_bases[index] - float(amount)
+
+    # attempt atomic update only if DB last_timestamp equals what we read into session_state (naive UTC)
+    old_db_ts = to_naive(st.session_state.last_timestamp)
+    result = col.update_one(
+        {"_id": STATE_DOC_ID, "last_timestamp": old_db_ts},
+        {"$set": {"base_values": new_bases, "last_timestamp": now}}
+    )
+
+    if result.modified_count == 1:
+        # success: update session_state snapshot
+        st.session_state.base_values = new_bases
+        st.session_state.last_timestamp = now
+        st.session_state.render_time = now
+        st.session_state.current_values_rendered = new_bases.copy()  # at render_time == now, rendered values == bases
+        return True, f"Subtracted {amount} from {VAR_NAMES[index]} (fast path)."
+
+    # --- Fallback: optimistic loop with DB read if fast-path failed ---
+    for attempt in range(max_retries):
+        doc = get_state_doc()
+        if not doc:
+            return False, "State document missing during fallback."
+
+        db_ts = to_naive(doc.get("last_timestamp"))
+        now2 = datetime.utcnow()
+        current_vals = compute_current_values(doc["base_values"], doc["increments"], db_ts, at_time=now2)
+
+        new_bases2 = current_vals.copy()
+        new_bases2[index] = new_bases2[index] - float(amount)
+
+        res2 = col.update_one(
+            {"_id": STATE_DOC_ID, "last_timestamp": db_ts},
+            {"$set": {"base_values": new_bases2, "last_timestamp": now2}}
+        )
+        if res2.modified_count == 1:
+            # success
+            st.session_state.base_values = new_bases2
+            st.session_state.increments = doc.get("increments", st.session_state.increments)
+            st.session_state.last_timestamp = now2
+            st.session_state.render_time = now2
+            st.session_state.current_values_rendered = new_bases2.copy()
+            return True, f"Subtracted {amount} from {VAR_NAMES[index]} (fallback after retry)."
+
+        # someone else updated, retry
+        time_module.sleep(retry_delay)
+
+    return False, "Failed to update after multiple retries; please try again."
+
+# ---------- Streamlit initialization & snapshot ----------
+if "db_loaded" not in st.session_state:
+    ensure_state_document()
+    doc = get_state_doc()
+    last_ts = to_naive(doc.get("last_timestamp"))
+    st.session_state.base_values = [float(x) for x in doc["base_values"]]
+    st.session_state.increments = [float(x) for x in doc.get("increments", INCREMENTS)]
+    st.session_state.last_timestamp = last_ts
+
+    # compute a render snapshot (one DB read, one compute) and store it
+    now_render = datetime.utcnow()
+    current_vals_render = compute_current_values(st.session_state.base_values, st.session_state.increments, st.session_state.last_timestamp, at_time=now_render)
+    st.session_state.current_values_rendered = current_vals_render
+    st.session_state.render_time = now_render
+
+    st.session_state.db_loaded = True
+    st.session_state.last_action_msg = ""
+    st.session_state.subtract_amt = 0.0
+    st.session_state.subtract_select = VAR_NAMES[0]
+
+# If config changed increments length, prefer DB increments but keep names from config
+if len(st.session_state.increments) != len(VAR_NAMES):
+    st.session_state.increments = INCREMENTS.copy()
+
+# ---------- UI ----------
+st.title("Live incrementing variables (local MongoDB persistence)")
+st.caption("State persists to local MongoDB. On reload/restart values are reconstructed from DB + elapsed time.")
+
+if cfg_err:
+    st.warning("Config warning: " + str(cfg_err))
+
+if st.button("Reload local config (does not overwrite DB state)"):
+    cfg2, cfg_err2 = load_config()
+    if cfg_err2:
+        st.warning(cfg_err2)
+    else:
+        st.success("Config reloaded (UI labels/inc rates updated if changed in config.json).")
+    st.session_state.increments = [float(x) for x in cfg2.get("INCREMENTS", INCREMENTS)]
+
+# Recompute display values based on the stored render snapshot (no DB read)
+now_render = datetime.utcnow()
+elapsed_since_render = (now_render - st.session_state.render_time).total_seconds()
+current_values = [val + inc * elapsed_since_render for val, inc in zip(st.session_state.current_values_rendered, st.session_state.increments)]
+
+# Build client-side renderer payload using the computed current_values at render_time == now_render
 payload = {
     "vars": [
         {"name": name, "value_at_render": float(val), "inc": float(inc)}
-        for name, val, inc in zip(VAR_NAMES, current_values, INCREMENTS)
+        for name, val, inc in zip(VAR_NAMES, current_values, st.session_state.increments)
     ],
     "updates_per_second": UPDATES_PER_SECOND,
     "decimals": DECIMALS,
-    "paused": bool(pause),
+    "paused": False
 }
 
 html = f"""
@@ -148,20 +241,11 @@ html = f"""
   <style>
     #vars {{ padding: 6px 0; max-width:760px; }}
     .var-row {{ display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-radius:8px; margin:8px 0; background:rgba(0,0,0,0.03); }}
-    .var-left {{ display:flex; align-items:center; gap:10px; }}
     .var-name {{ font-weight:700; font-size:18px; width:260px; }}
     .var-value {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, 'Courier New', monospace; font-size:24px; min-width:220px; text-align:right; }}
-    #live-meta {{ margin-top:10px; color:#333; font-size:14px; }}
-    #fallback {{ color:#b00; font-size:13px; margin-top:8px; }}
   </style>
 
   <div id="vars"></div>
-  <div id="live-meta">
-    <span>Live since: <span id="live-since">0.00</span> s</span>
-    &nbsp;•&nbsp;
-    <span id="fps">updates/sec: {payload['updates_per_second']}</span>
-  </div>
-  <div id="fallback">If numbers don't move, check your browser console for errors or verify that scripts/components are allowed.</div>
 </div>
 
 <script>
@@ -169,7 +253,7 @@ html = f"""
   const payload = {json.dumps(payload)};
   const container = document.getElementById('vars');
   const decimals = payload.decimals || 4;
-  const ups = Math.max(1, payload.updates_per_second || 20);
+  const ups = Math.max(1, payload.updates_per_second || 10);
   const interval_ms = Math.round(1000 / ups);
 
   payload.vars.forEach((v, idx) => {{
@@ -177,19 +261,16 @@ html = f"""
     row.className = 'var-row';
     row.id = 'var-row-' + idx;
 
-    const left = document.createElement('div');
-    left.className = 'var-left';
     const name = document.createElement('div');
     name.className = 'var-name';
     name.innerText = v.name;
-    left.appendChild(name);
 
     const val = document.createElement('div');
     val.className = 'var-value';
     val.id = 'var-value-' + idx;
     val.innerText = Number(v.value_at_render).toFixed(decimals);
 
-    row.appendChild(left);
+    row.appendChild(name);
     row.appendChild(val);
     container.appendChild(row);
 
@@ -200,7 +281,6 @@ html = f"""
   }});
 
   const perfStart = performance.now();
-  const liveSinceEl = document.getElementById('live-since');
 
   function updateAll() {{
     const dt = (performance.now() - perfStart) / 1000.0;
@@ -211,64 +291,49 @@ html = f"""
       const el = document.getElementById('var-value-' + idx);
       if (el) el.innerText = current.toFixed(decimals);
     }});
-    if (liveSinceEl) liveSinceEl.innerText = ((performance.now() - perfStart)/1000.0).toFixed(2);
   }}
 
-  if (payload.paused) {{
-    updateAll();
-  }} else {{
-    updateAll();
-    if (window.__live_vars_interval) clearInterval(window.__live_vars_interval);
-    window.__live_vars_interval = setInterval(updateAll, interval_ms);
-  }}
+  updateAll();
+  if (window.__live_vars_interval) clearInterval(window.__live_vars_interval);
+  window.__live_vars_interval = setInterval(updateAll, interval_ms);
 }})();
 </script>
 """
-components.html(html, height=380, scrolling=False)
+
+components.html(html, height=360, scrolling=False)
 
 st.markdown("---")
 
-# === SUBTRACTION UI (CALLBACK-ONLY ACTION) ===
+# === Subtraction UI (no forms) ===
 st.subheader("Subtract from a variable")
 
-# Widgets (no action here; action happens only inside the callback)
-st.selectbox("Choose variable", VAR_NAMES, key="subtract_select")
-st.number_input("Amount to subtract", key="subtract_amt", format="%.6f", step=1.0)
+col_sel, col_amt, col_btn = st.columns([2, 2, 1])
+with col_sel:
+    sel = st.selectbox("Choose variable", VAR_NAMES, index=VAR_NAMES.index(st.session_state.subtract_select))
+    st.session_state.subtract_select = sel
 
-def _do_subtract():
-    """Run ONLY on button click. Safe against reruns from other widgets."""
-    sel = st.session_state.get("subtract_select", VAR_NAMES[0])
-    amt = float(st.session_state.get("subtract_amt", 0.0))
+with col_amt:
+    amt = st.number_input("Amount to subtract", format="%.6f", step=1.0, value=float(st.session_state.get("subtract_amt", 0.0)))
+    st.session_state.subtract_amt = float(amt)
 
-    if sel not in VAR_NAMES or amt == 0.0:
-        # Nothing to do
-        st.session_state["last_action_msg"] = ""
-        return
+with col_btn:
+    if st.button("Subtract"):
+        idx = VAR_NAMES.index(st.session_state.subtract_select)
+        amount = float(st.session_state.subtract_amt)
+        if amount == 0.0:
+            st.warning("Enter a non-zero amount to subtract.")
+        else:
+            success, msg = subtract_optimized(idx, amount)
+            if success:
+                st.success(msg)
+                # reset the local input to avoid repeat
+                st.session_state.subtract_amt = 0.0
+            else:
+                st.error(msg)
 
-    # Recompute precise current values at click time
-    now2 = time.time()
-    elapsed2 = now2 - st.session_state.last_timestamp
-    current_values2 = [base + inc * elapsed2 for base, inc in zip(st.session_state.base_values, INCREMENTS)]
-
-    idx = VAR_NAMES.index(sel)
-    st.session_state.base_values[idx] = current_values2[idx] - amt
-    st.session_state.last_timestamp = now2
-
-    # Clear amount to avoid accidental repeat; store a message
-    st.session_state["subtract_amt"] = 0.0
-    st.session_state["last_action_msg"] = f"Subtracted {amt} from {sel}."
-
-# Button triggers ONLY the callback (no inline if st.button block)
-st.button(
-    "Subtract",
-    key="subtract_btn",
-    on_click=_do_subtract,
-    disabled=(st.session_state.get("subtract_amt", 0.0) == 0.0),
-)
-
-# Show last action message (set by the callback)
-if st.session_state.get("last_action_msg"):
-    st.success(st.session_state["last_action_msg"])
+# Helpful info
+st.write(f"Last DB save timestamp (UTC, naive): {st.session_state.last_timestamp.isoformat()}")
+st.write("Note: display uses a cached render snapshot and applies increments since that snapshot. On successful subtraction we try a fast atomic update; if a conflict occurs we retry with a fresh DB read.")
 
 st.markdown("---")
-st.write("To change variables/increments, edit the local `config.json` file (next to app.py). Click **Reload config from file** to apply changes.")
+st.write("To migrate to MongoDB Atlas later, change the MONGO_URI at the top to your Atlas connection string.")
