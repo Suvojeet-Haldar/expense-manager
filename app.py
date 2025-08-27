@@ -14,7 +14,7 @@ st.set_page_config(page_title="Live incrementing variables (Mongo local)", layou
 DEFAULT_CONFIG = {
     "VAR_NAMES": ["Var A", "Var B", "Var C", "Var D", "Var E"],
     "START_VALUES": [0.0, 10.5, 25.0, -5.0, 100.0],
-    "INCREMENTS": [0.1, 0.1, 0.1, 0.1, 0.1],  # default same increment-rate for now
+    "INCREMENTS": [0.1, 0.1, 0.1, 0.1, 0.1],
     "UPDATES_PER_SECOND": 10,
     "DECIMALS": 4
 }
@@ -57,41 +57,27 @@ col = db[COLLECTION_NAME]
 STATE_DOC_ID = "live_state"  # fixed _id for single-state document
 
 def to_naive(dt):
-    """
-    Normalize dt to a naive UTC datetime (no tzinfo).
-    Accepts datetime or ISO-format string. If parsing fails, returns current UTC now (naive).
-    """
+    """Normalize to naive UTC datetime. Accept str or datetime."""
     if dt is None:
         return datetime.utcnow()
     if isinstance(dt, str):
         try:
-            parsed = datetime.fromisoformat(dt)
-            dt = parsed
+            dt = datetime.fromisoformat(dt)
         except Exception:
             try:
-                # fallback: try removing Z and parse
                 dt = datetime.fromisoformat(dt.replace("Z", ""))
             except Exception:
                 return datetime.utcnow()
-    # dt is datetime
     if getattr(dt, "tzinfo", None) is not None:
-        # convert to UTC naive
-        try:
-            utc = dt.astimezone().utcfromtimestamp(dt.timestamp())
-        except Exception:
-            # simpler: convert by timestamp
-            utc = datetime.utcfromtimestamp(dt.timestamp())
-        # utc is naive (from utcfromtimestamp)
-        return utc
-    else:
-        # already naive, assume it's UTC
-        return dt
+        # convert to naive UTC via timestamp
+        return datetime.utcfromtimestamp(dt.timestamp())
+    return dt
 
 def ensure_state_document():
-    """Ensure a single state document exists in DB with base_values, increments and last_timestamp (naive UTC)."""
+    """Make sure the state doc exists with naive UTC timestamp."""
     doc = col.find_one({"_id": STATE_DOC_ID})
     if doc is None:
-        now = datetime.utcnow()  # naive UTC
+        now = datetime.utcnow()
         doc = {
             "_id": STATE_DOC_ID,
             "base_values": START_VALUES.copy(),
@@ -102,16 +88,11 @@ def ensure_state_document():
     return doc
 
 def get_state_doc():
-    """Fetch latest state doc from DB (returns dict)."""
     return col.find_one({"_id": STATE_DOC_ID})
 
 def compute_current_values(base_values, increments, last_timestamp, at_time=None):
-    """Return list of current values given base_values, increments, and last_timestamp.
-       last_timestamp and at_time are treated as naive UTC datetimes.
-    """
     if at_time is None:
         at_time = datetime.utcnow()
-    # normalize to naive UTC
     last_ts = to_naive(last_timestamp)
     at_ts = to_naive(at_time)
     elapsed = (at_ts - last_ts).total_seconds()
@@ -124,33 +105,33 @@ def subtract_optimized(index, amount, max_retries=8, retry_delay=0.05):
     If fails due to concurrent update, fallback to read-and-retry loop.
     Returns (success:bool, message:str).
     """
-    # --- Fast path using local snapshot ---
     now = datetime.utcnow()
+    # use render snapshot if present
     render_time = to_naive(st.session_state.get("render_time", st.session_state.last_timestamp))
     current_rendered = st.session_state.get("current_values_rendered", compute_current_values(
         st.session_state.base_values, st.session_state.increments, st.session_state.last_timestamp, at_time=render_time))
     elapsed_since_render = (now - render_time).total_seconds()
     current_now = [val + inc * elapsed_since_render for val, inc in zip(current_rendered, st.session_state.increments)]
 
+    # prepare new bases (value at now minus subtraction)
     new_bases = current_now.copy()
     new_bases[index] = new_bases[index] - float(amount)
 
-    # attempt atomic update only if DB last_timestamp equals what we read into session_state (naive UTC)
+    # Try fast atomic update: only succeed if DB last_timestamp equals session state's last_timestamp
     old_db_ts = to_naive(st.session_state.last_timestamp)
     result = col.update_one(
         {"_id": STATE_DOC_ID, "last_timestamp": old_db_ts},
         {"$set": {"base_values": new_bases, "last_timestamp": now}}
     )
-
     if result.modified_count == 1:
-        # success: update session_state snapshot
+        # success -> update session_state snapshot
         st.session_state.base_values = new_bases
         st.session_state.last_timestamp = now
         st.session_state.render_time = now
-        st.session_state.current_values_rendered = new_bases.copy()  # at render_time == now, rendered values == bases
+        st.session_state.current_values_rendered = new_bases.copy()
         return True, f"Subtracted {amount} from {VAR_NAMES[index]} (fast path)."
 
-    # --- Fallback: optimistic loop with DB read if fast-path failed ---
+    # Fallback: read from DB and retry (optimistic concurrency)
     for attempt in range(max_retries):
         doc = get_state_doc()
         if not doc:
@@ -158,7 +139,7 @@ def subtract_optimized(index, amount, max_retries=8, retry_delay=0.05):
 
         db_ts = to_naive(doc.get("last_timestamp"))
         now2 = datetime.utcnow()
-        current_vals = compute_current_values(doc["base_values"], doc["increments"], db_ts, at_time=now2)
+        current_vals = compute_current_values(doc["base_values"], doc.get("increments", st.session_state.increments), db_ts, at_time=now2)
 
         new_bases2 = current_vals.copy()
         new_bases2[index] = new_bases2[index] - float(amount)
@@ -176,7 +157,7 @@ def subtract_optimized(index, amount, max_retries=8, retry_delay=0.05):
             st.session_state.current_values_rendered = new_bases2.copy()
             return True, f"Subtracted {amount} from {VAR_NAMES[index]} (fallback after retry)."
 
-        # someone else updated, retry
+        # someone else updated; small sleep and retry
         time_module.sleep(retry_delay)
 
     return False, "Failed to update after multiple retries; please try again."
@@ -190,7 +171,7 @@ if "db_loaded" not in st.session_state:
     st.session_state.increments = [float(x) for x in doc.get("increments", INCREMENTS)]
     st.session_state.last_timestamp = last_ts
 
-    # compute a render snapshot (one DB read, one compute) and store it
+    # compute one render snapshot (one DB read + compute)
     now_render = datetime.utcnow()
     current_vals_render = compute_current_values(st.session_state.base_values, st.session_state.increments, st.session_state.last_timestamp, at_time=now_render)
     st.session_state.current_values_rendered = current_vals_render
@@ -201,9 +182,13 @@ if "db_loaded" not in st.session_state:
     st.session_state.subtract_amt = 0.0
     st.session_state.subtract_select = VAR_NAMES[0]
 
-# If config changed increments length, prefer DB increments but keep names from config
+# Defensive: ensure increments length is correct
 if len(st.session_state.increments) != len(VAR_NAMES):
     st.session_state.increments = INCREMENTS.copy()
+
+# Initialize UI helper state
+st.session_state.setdefault("busy", False)
+st.session_state.setdefault("subtract_result", None)  # will hold dict {"ok":bool,"msg":str}
 
 # ---------- UI ----------
 st.title("Live incrementing variables (local MongoDB persistence)")
@@ -304,7 +289,7 @@ components.html(html, height=360, scrolling=False)
 
 st.markdown("---")
 
-# === Subtraction UI (no forms) ===
+# === Subtraction UI (callback-based, show feedback only after DB confirmation) ===
 st.subheader("Subtract from a variable")
 
 col_sel, col_amt, col_btn = st.columns([2, 2, 1])
@@ -316,24 +301,45 @@ with col_amt:
     amt = st.number_input("Amount to subtract", format="%.6f", step=1.0, value=float(st.session_state.get("subtract_amt", 0.0)))
     st.session_state.subtract_amt = float(amt)
 
-with col_btn:
-    if st.button("Subtract"):
+# callback for button:
+def do_subtract_callback():
+    """Runs only when button clicked. Sets subtract_result in session_state."""
+    st.session_state["busy"] = True
+    st.session_state["subtract_result"] = None
+    try:
         idx = VAR_NAMES.index(st.session_state.subtract_select)
         amount = float(st.session_state.subtract_amt)
         if amount == 0.0:
-            st.warning("Enter a non-zero amount to subtract.")
+            st.session_state["subtract_result"] = {"ok": False, "msg": "Enter a non-zero amount to subtract."}
+            return
+        ok, message = subtract_optimized(idx, amount)
+        if ok:
+            # confirmed success -> clear input amount only now
+            st.session_state.subtract_amt = 0.0
+            st.session_state["subtract_result"] = {"ok": True, "msg": message}
         else:
-            success, msg = subtract_optimized(idx, amount)
-            if success:
-                st.success(msg)
-                # reset the local input to avoid repeat
-                st.session_state.subtract_amt = 0.0
-            else:
-                st.error(msg)
+            st.session_state["subtract_result"] = {"ok": False, "msg": message}
+    except Exception as e:
+        st.session_state["subtract_result"] = {"ok": False, "msg": f"Exception: {e}"}
+    finally:
+        st.session_state["busy"] = False
+
+# disable button if amount == 0 or busy
+disable_btn = (st.session_state.get("subtract_amt", 0.0) == 0.0) or st.session_state.get("busy", False)
+
+st.button("Subtract", key="subtract_btn", on_click=do_subtract_callback, disabled=disable_btn)
+
+# Show result only from session_state (guaranteed to reflect real DB outcome)
+res = st.session_state.get("subtract_result")
+if res is not None:
+    if res.get("ok"):
+        st.success(res.get("msg"))
+    else:
+        st.error(res.get("msg"))
 
 # Helpful info
 st.write(f"Last DB save timestamp (UTC, naive): {st.session_state.last_timestamp.isoformat()}")
-st.write("Note: display uses a cached render snapshot and applies increments since that snapshot. On successful subtraction we try a fast atomic update; if a conflict occurs we retry with a fresh DB read.")
+st.write("Note: display uses a cached render snapshot and applies increments since that snapshot. On successful subtraction the DB is updated atomically.")
 
 st.markdown("---")
 st.write("To migrate to MongoDB Atlas later, change the MONGO_URI at the top to your Atlas connection string.")
