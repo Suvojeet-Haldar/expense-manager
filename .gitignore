@@ -1,38 +1,3 @@
-# git init
-# cat > .gitignore <<'GITIGNORE'
-# # Python
-# __pycache__/
-# *.pyc
-# *.pyo
-# *.pyd
-# venv/
-# env/
-# .Python
-# pip-wheel-metadata/
-# *.egg-info/
-
-# # Editor / OS
-# .vscode/
-# .idea/
-# .DS_Store
-
-# # env
-# .env
-# .env.* 
-# secrets.json
-
-# # Streamlit / Jupyter
-# .streamlit/
-# .ipynb_checkpoints/
-
-# # logs
-# *.log
-
-# GITIGNORE
-# git add .gitignore
-# git commit -m "chore: add .gitignore"
-
-cat > .gitignore <<'GITIGNORE'
 # Python
 __pycache__/
 *.pyc
@@ -60,4 +25,23 @@ secrets.json
 
 # logs
 *.log
-GITIGNORE
+
+# Local DB / runtime
+*.db
+*.sqlite3
+*.sqlite
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Secrets / config files (DO NOT COMMIT)
+auth_config.yaml
+auth_config.yml
+config.json
+secrets.toml
+
+# Optional: lockfiles
+poetry.lock
+Pipfile.lock

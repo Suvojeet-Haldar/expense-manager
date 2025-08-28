@@ -1,0 +1,7 @@
+{
+  "VAR_NAMES": ["Var A", "Var B", "Var C", "Var D", "Var E"],
+  "START_VALUES": [0.0, 10.5, 25.0, -5.0, 100.0],
+  "INCREMENTS": [0.1, 0.1, 0.1, 0.1, 0.1],
+  "UPDATES_PER_SECOND": 10,
+  "DECIMALS": 4
+}

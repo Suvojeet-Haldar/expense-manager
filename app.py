@@ -2,11 +2,16 @@
 import time
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import time as time_module
 import streamlit as st
 import streamlit.components.v1 as components
 from pymongo import MongoClient
+
+# NEW: auth imports
+import yaml
+from yaml.loader import SafeLoader
+import streamlit_authenticator as stauth
 
 st.set_page_config(page_title="Live incrementing variables (Mongo local)", layout="centered")
 
@@ -19,6 +24,7 @@ DEFAULT_CONFIG = {
     "DECIMALS": 4
 }
 CONFIG_PATH = "config.json"
+AUTH_CONFIG_PATH = "auth_config.yaml"  # NEW
 
 def load_config(path=CONFIG_PATH):
     if os.path.exists(path):
@@ -33,8 +39,20 @@ def load_config(path=CONFIG_PATH):
     else:
         return DEFAULT_CONFIG.copy(), None
 
-cfg, cfg_err = load_config()
+# NEW: load auth YAML
+def load_auth_config(path=AUTH_CONFIG_PATH):
+    if not os.path.exists(path):
+        st.error(f"Auth config file '{path}' not found. Create it with hashed passwords.")
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.load(f, Loader=SafeLoader)
+    except Exception as e:
+        st.error(f"Error reading '{path}': {e}")
+        return None
 
+# Read app config (unchanged)
+cfg, cfg_err = load_config()
 VAR_NAMES = cfg["VAR_NAMES"]
 START_VALUES = [float(x) for x in cfg["START_VALUES"]]
 INCREMENTS = [float(x) for x in cfg["INCREMENTS"]]
@@ -57,32 +75,37 @@ col = db[COLLECTION_NAME]
 STATE_DOC_ID = "live_state"  # fixed _id for single-state document
 
 def to_naive(dt):
-    """Normalize to naive UTC datetime. Accept str or datetime."""
+    """Normalize to naive UTC datetime. Accept str or datetime.
+    Returns a naive UTC datetime (tzinfo removed) suitable for consistent storage/comparison.
+    """
     if dt is None:
-        return datetime.utcnow()
+        return datetime.now(timezone.utc).replace(tzinfo=None)
     if isinstance(dt, str):
         try:
-            dt = datetime.fromisoformat(dt)
+            parsed = datetime.fromisoformat(dt)
         except Exception:
             try:
-                dt = datetime.fromisoformat(dt.replace("Z", ""))
+                parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))
             except Exception:
-                return datetime.utcnow()
+                return datetime.now(timezone.utc).replace(tzinfo=None)
+        dt = parsed
+
+    # If dt has tzinfo, convert to UTC and return naive
     if getattr(dt, "tzinfo", None) is not None:
-        # convert to naive UTC via timestamp
-        return datetime.utcfromtimestamp(dt.timestamp())
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    # dt is naive: assume it's already UTC and return as-is
     return dt
 
 def ensure_state_document():
     """Make sure the state doc exists with naive UTC timestamp."""
     doc = col.find_one({"_id": STATE_DOC_ID})
     if doc is None:
-        now = datetime.utcnow()
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         doc = {
             "_id": STATE_DOC_ID,
             "base_values": START_VALUES.copy(),
             "increments": INCREMENTS.copy(),
-            "last_timestamp": now
+            "last_timestamp": now_naive
         }
         col.insert_one(doc)
     return doc
@@ -91,8 +114,12 @@ def get_state_doc():
     return col.find_one({"_id": STATE_DOC_ID})
 
 def compute_current_values(base_values, increments, last_timestamp, at_time=None):
+    """Compute current values given base_values at last_timestamp and increments per second.
+
+    last_timestamp and at_time may be naive datetimes (assumed UTC) or strings.
+    """
     if at_time is None:
-        at_time = datetime.utcnow()
+        at_time = datetime.now(timezone.utc).replace(tzinfo=None)
     last_ts = to_naive(last_timestamp)
     at_ts = to_naive(at_time)
     elapsed = (at_ts - last_ts).total_seconds()
@@ -105,12 +132,14 @@ def subtract_optimized(index, amount, max_retries=8, retry_delay=0.05):
     If fails due to concurrent update, fallback to read-and-retry loop.
     Returns (success:bool, message:str).
     """
-    now = datetime.utcnow()
+    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
     # use render snapshot if present
     render_time = to_naive(st.session_state.get("render_time", st.session_state.last_timestamp))
-    current_rendered = st.session_state.get("current_values_rendered", compute_current_values(
-        st.session_state.base_values, st.session_state.increments, st.session_state.last_timestamp, at_time=render_time))
-    elapsed_since_render = (now - render_time).total_seconds()
+    current_rendered = st.session_state.get(
+        "current_values_rendered",
+        compute_current_values(st.session_state.base_values, st.session_state.increments, st.session_state.last_timestamp, at_time=render_time)
+    )
+    elapsed_since_render = (now_naive - render_time).total_seconds()
     current_now = [val + inc * elapsed_since_render for val, inc in zip(current_rendered, st.session_state.increments)]
 
     # prepare new bases (value at now minus subtraction)
@@ -121,13 +150,13 @@ def subtract_optimized(index, amount, max_retries=8, retry_delay=0.05):
     old_db_ts = to_naive(st.session_state.last_timestamp)
     result = col.update_one(
         {"_id": STATE_DOC_ID, "last_timestamp": old_db_ts},
-        {"$set": {"base_values": new_bases, "last_timestamp": now}}
+        {"$set": {"base_values": new_bases, "last_timestamp": now_naive}}
     )
     if result.modified_count == 1:
         # success -> update session_state snapshot
         st.session_state.base_values = new_bases
-        st.session_state.last_timestamp = now
-        st.session_state.render_time = now
+        st.session_state.last_timestamp = now_naive
+        st.session_state.render_time = now_naive
         st.session_state.current_values_rendered = new_bases.copy()
         return True, f"Subtracted {amount} from {VAR_NAMES[index]} (fast path)."
 
@@ -138,7 +167,7 @@ def subtract_optimized(index, amount, max_retries=8, retry_delay=0.05):
             return False, "State document missing during fallback."
 
         db_ts = to_naive(doc.get("last_timestamp"))
-        now2 = datetime.utcnow()
+        now2 = datetime.now(timezone.utc).replace(tzinfo=None)
         current_vals = compute_current_values(doc["base_values"], doc.get("increments", st.session_state.increments), db_ts, at_time=now2)
 
         new_bases2 = current_vals.copy()
@@ -162,7 +191,106 @@ def subtract_optimized(index, amount, max_retries=8, retry_delay=0.05):
 
     return False, "Failed to update after multiple retries; please try again."
 
-# ---------- Streamlit initialization & snapshot ----------
+# ======================================================================
+#                            AUTHENTICATION (UPDATED & ROBUST)
+# ======================================================================
+auth_cfg = load_auth_config()
+if auth_cfg is None:
+    st.stop()
+
+# NOTE: streamlit-authenticator removed the `preauthorized` parameter from Authenticate.
+# Use named args and call register_user(...) separately if you need registration with pre-authorization.
+try:
+    authenticator = stauth.Authenticate(
+        credentials=auth_cfg["credentials"],
+        cookie_name=auth_cfg["cookie"]["name"],
+        key=auth_cfg["cookie"]["key"],
+        cookie_expiry_days=auth_cfg["cookie"]["expiry_days"],
+    )
+except Exception as e:
+    st.error(f"Failed to initialize authenticator: {e}")
+    st.stop()
+
+def attempt_login_variants(auth):
+    """
+    Try several invocation patterns for auth.login(...) to support different library versions.
+    Returns a 3-tuple (name, authentication_status, username) if available, otherwise None.
+    """
+    candidates = [
+        lambda: auth.login("Login", "main"),
+        lambda: auth.login("Login", location="main"),
+        lambda: auth.login(location="main"),
+        lambda: auth.login("main"),
+        lambda: auth.login("Login", "sidebar"),
+        lambda: auth.login("Login", "unrendered"),
+        lambda: auth.login("unrendered"),
+    ]
+    for fn in candidates:
+        try:
+            res = fn()
+            if isinstance(res, tuple) and len(res) == 3:
+                return res
+        except Exception:
+            # ignore and try next pattern
+            continue
+    return None
+
+# 1) Try to get a tuple result from login()
+login_result = attempt_login_variants(authenticator)
+
+if login_result is not None:
+    name, authentication_status, username = login_result
+else:
+    # 2) Fallback: some versions set these keys in st.session_state instead of returning them
+    authentication_status = st.session_state.get("authentication_status", None)
+    name = st.session_state.get("name", "")
+    username = st.session_state.get("username", "")
+
+    # 3) Extra fallbacks: try several alternative keys that different versions might set
+    if authentication_status is None:
+        authentication_status = st.session_state.get("auth_status",
+                                 st.session_state.get("authentication_status_guest",
+                                 st.session_state.get(f"{auth_cfg['cookie']['name']}_authentication_status", None)))
+    if not name:
+        name = st.session_state.get("display_name",
+               st.session_state.get(f"{auth_cfg['cookie']['name']}_name", ""))
+    if not username:
+        username = st.session_state.get("user",
+                   st.session_state.get(f"{auth_cfg['cookie']['name']}_username", ""))
+
+# If we still don't know the authentication status, show the login hint and stop
+if authentication_status is None:
+    st.info("Please enter your username and password (then press Submit/login on the login box).")
+    # optional debug: reveal session_state keys to help diagnose (unchecked by default)
+    if st.checkbox("Show session_state keys (debug)", value=False):
+        st.write(sorted(list(st.session_state.keys())))
+    st.stop()
+
+if authentication_status is False:
+    st.error("Username/password is incorrect")
+    st.stop()
+
+# Logged in — show logout & who
+# logout() signature varies across versions; try a safe variant set
+try:
+    authenticator.logout("Logout", "sidebar")
+except TypeError:
+    try:
+        authenticator.logout("Logout", location="sidebar")
+    except Exception:
+        # final fallback: call without args (if supported) or ignore
+        try:
+            authenticator.logout()
+        except Exception:
+            pass
+
+st.sidebar.caption(f"Signed in as {name} ({username})")
+
+# ======================================================================
+#                         MAIN APP (unchanged logic)
+# ======================================================================
+
+# Streamlit initialization & snapshot
 if "db_loaded" not in st.session_state:
     ensure_state_document()
     doc = get_state_doc()
@@ -172,8 +300,13 @@ if "db_loaded" not in st.session_state:
     st.session_state.last_timestamp = last_ts
 
     # compute one render snapshot (one DB read + compute)
-    now_render = datetime.utcnow()
-    current_vals_render = compute_current_values(st.session_state.base_values, st.session_state.increments, st.session_state.last_timestamp, at_time=now_render)
+    now_render = datetime.now(timezone.utc).replace(tzinfo=None)
+    current_vals_render = compute_current_values(
+        st.session_state.base_values,
+        st.session_state.increments,
+        st.session_state.last_timestamp,
+        at_time=now_render
+    )
     st.session_state.current_values_rendered = current_vals_render
     st.session_state.render_time = now_render
 
@@ -206,9 +339,10 @@ if st.button("Reload local config (does not overwrite DB state)"):
     st.session_state.increments = [float(x) for x in cfg2.get("INCREMENTS", INCREMENTS)]
 
 # Recompute display values based on the stored render snapshot (no DB read)
-now_render = datetime.utcnow()
+now_render = datetime.now(timezone.utc).replace(tzinfo=None)
 elapsed_since_render = (now_render - st.session_state.render_time).total_seconds()
-current_values = [val + inc * elapsed_since_render for val, inc in zip(st.session_state.current_values_rendered, st.session_state.increments)]
+current_values = [val + inc * elapsed_since_render
+                  for val, inc in zip(st.session_state.current_values_rendered, st.session_state.increments)]
 
 # Build client-side renderer payload using the computed current_values at render_time == now_render
 payload = {
