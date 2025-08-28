@@ -324,19 +324,20 @@ st.session_state.setdefault("busy", False)
 st.session_state.setdefault("subtract_result", None)  # will hold dict {"ok":bool,"msg":str}
 
 # ---------- UI ----------
-st.title("Live incrementing variables (local MongoDB persistence)")
-st.caption("State persists to local MongoDB. On reload/restart values are reconstructed from DB + elapsed time.")
+# st.title("Live incrementing variables (local MongoDB persistence)")
+st.title("Live Expense allocations")
+# st.caption("State persists to local MongoDB. On reload/restart values are reconstructed from DB + elapsed time.")
 
 if cfg_err:
     st.warning("Config warning: " + str(cfg_err))
 
-if st.button("Reload local config (does not overwrite DB state)"):
-    cfg2, cfg_err2 = load_config()
-    if cfg_err2:
-        st.warning(cfg_err2)
-    else:
-        st.success("Config reloaded (UI labels/inc rates updated if changed in config.json).")
-    st.session_state.increments = [float(x) for x in cfg2.get("INCREMENTS", INCREMENTS)]
+# if st.button("Reload local config (does not overwrite DB state)"):
+#     cfg2, cfg_err2 = load_config()
+#     if cfg_err2:
+#         st.warning(cfg_err2)
+#     else:
+#         st.success("Config reloaded (UI labels/inc rates updated if changed in config.json).")
+#     st.session_state.increments = [float(x) for x in cfg2.get("INCREMENTS", INCREMENTS)]
 
 # Recompute display values based on the stored render snapshot (no DB read)
 now_render = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -359,9 +360,11 @@ html = f"""
 <div id="live-root" style="font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial;">
   <style>
     #vars {{ padding: 6px 0; max-width:760px; }}
-    .var-row {{ display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-radius:8px; margin:8px 0; background:rgba(0,0,0,0.03); }}
+    .var-row {{ display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-radius:8px; margin:4px 0; background:rgba(0,0,0,0.03); }}
     .var-name {{ font-weight:700; font-size:18px; width:260px; }}
     .var-value {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, 'Courier New', monospace; font-size:24px; min-width:220px; text-align:right; }}
+    .brown {{ color:#8B4513; }}  /* brown color */
+    .separator {{ height:12px; border-bottom:1px solid #ddd; margin:8px 0; }}
   </style>
 
   <div id="vars"></div>
@@ -376,6 +379,13 @@ html = f"""
   const interval_ms = Math.round(1000 / ups);
 
   payload.vars.forEach((v, idx) => {{
+    // Insert a separator gap before the 4th (idx===3) and 5th (idx===4) rows
+    if (idx === 3 || idx === 4) {{
+      const sep = document.createElement('div');
+      sep.className = 'separator';
+      container.appendChild(sep);
+    }}
+
     const row = document.createElement('div');
     row.className = 'var-row';
     row.id = 'var-row-' + idx;
@@ -383,6 +393,20 @@ html = f"""
     const name = document.createElement('div');
     name.className = 'var-name';
     name.innerText = v.name;
+
+    // First three variables -> brown name
+    if (idx < 3) {{
+      name.classList.add('brown');
+    }}
+
+    // For the 4th variable, highlight the substring "Dudu" in brown if present
+    if (idx === 3) {{
+      const special = "Dudu";
+      if (name.innerText.includes(special)) {{
+        // replace only the first occurrence (that's fine for typical names)
+        name.innerHTML = name.innerText.replace(special, `<span class="brown">${{special}}</span>`);
+      }}
+    }}
 
     const val = document.createElement('div');
     val.className = 'var-value';
@@ -424,7 +448,8 @@ components.html(html, height=360, scrolling=False)
 st.markdown("---")
 
 # === Subtraction UI (callback-based, show feedback only after DB confirmation) ===
-st.subheader("Subtract from a variable")
+# st.subheader("Subtract from a variable")
+st.subheader("Subtract from the Expense allocations:")
 
 col_sel, col_amt, col_btn = st.columns([2, 2, 1])
 with col_sel:
