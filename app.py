@@ -59,9 +59,18 @@ INCREMENTS = [float(x) for x in cfg["INCREMENTS"]]
 UPDATES_PER_SECOND = int(cfg.get("UPDATES_PER_SECOND", DEFAULT_CONFIG["UPDATES_PER_SECOND"]))
 DECIMALS = int(cfg.get("DECIMALS", DEFAULT_CONFIG["DECIMALS"]))
 
-if not (len(VAR_NAMES) == len(START_VALUES) == len(INCREMENTS) == 5):
-    st.error("VAR_NAMES, START_VALUES and INCREMENTS must each have exactly 5 items. Fix config.json.")
+# Relaxed length-check: allow dynamic number of allocations.
+# If config arrays mismatch in length, trim to shortest and warn.
+min_len = min(len(VAR_NAMES), len(START_VALUES), len(INCREMENTS))
+if min_len == 0:
+    st.error("Config arrays must not be empty. Fix config.json or use defaults.")
     st.stop()
+if not (len(VAR_NAMES) == len(START_VALUES) == len(INCREMENTS)):
+    # trim to shortest to keep arrays aligned
+    VAR_NAMES = VAR_NAMES[:min_len]
+    START_VALUES = START_VALUES[:min_len]
+    INCREMENTS = INCREMENTS[:min_len]
+    cfg_err = (cfg_err or "") + " Config arrays had mismatched lengths; trimmed to shortest length."
 
 # ---------- MongoDB (local) ----------
 MONGO_URI = "mongodb://localhost:27017/"
@@ -97,17 +106,46 @@ def to_naive(dt):
     return dt
 
 def ensure_state_document():
-    """Make sure the state doc exists with naive UTC timestamp."""
+    """Make sure the state doc exists with naive UTC timestamp and names array."""
     doc = col.find_one({"_id": STATE_DOC_ID})
     if doc is None:
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         doc = {
             "_id": STATE_DOC_ID,
+            "names": VAR_NAMES.copy(),
             "base_values": START_VALUES.copy(),
             "increments": INCREMENTS.copy(),
             "last_timestamp": now_naive
         }
         col.insert_one(doc)
+    else:
+        # if names / increments / base_values missing or mismatched, patch doc
+        changed = False
+        names = doc.get("names")
+        base = doc.get("base_values")
+        incs = doc.get("increments")
+        if names is None:
+            doc["names"] = VAR_NAMES.copy()
+            changed = True
+        if base is None:
+            doc["base_values"] = START_VALUES.copy()
+            changed = True
+        if incs is None:
+            doc["increments"] = INCREMENTS.copy()
+            changed = True
+        # if arrays have different lengths, align them to the same shortest length
+        if not (len(doc["names"]) == len(doc["base_values"]) == len(doc["increments"])):
+            mn = min(len(doc["names"]), len(doc["base_values"]), len(doc["increments"]))
+            doc["names"] = doc["names"][:mn]
+            doc["base_values"] = doc["base_values"][:mn]
+            doc["increments"] = doc["increments"][:mn]
+            changed = True
+        if changed:
+            col.update_one({"_id": STATE_DOC_ID}, {"$set": {
+                "names": doc["names"],
+                "base_values": doc["base_values"],
+                "increments": doc["increments"]
+            }})
     return doc
 
 def get_state_doc():
@@ -158,7 +196,7 @@ def subtract_optimized(index, amount, max_retries=8, retry_delay=0.05):
         st.session_state.last_timestamp = now_naive
         st.session_state.render_time = now_naive
         st.session_state.current_values_rendered = new_bases.copy()
-        return True, f"Subtracted {amount} from {VAR_NAMES[index]} (fast path)."
+        return True, f"Subtracted {amount} from {st.session_state.var_names[index]} (fast path)."
 
     # Fallback: read from DB and retry (optimistic concurrency)
     for attempt in range(max_retries):
@@ -184,12 +222,187 @@ def subtract_optimized(index, amount, max_retries=8, retry_delay=0.05):
             st.session_state.last_timestamp = now2
             st.session_state.render_time = now2
             st.session_state.current_values_rendered = new_bases2.copy()
-            return True, f"Subtracted {amount} from {VAR_NAMES[index]} (fallback after retry)."
+            return True, f"Subtracted {amount} from {st.session_state.var_names[index]} (fallback after retry)."
 
         # someone else updated; small sleep and retry
         time_module.sleep(retry_delay)
 
     return False, "Failed to update after multiple retries; please try again."
+
+# ---------- Add allocation helper (new) ----------
+def add_allocation(name: str, start_value: float, increment: float, max_retries=8, retry_delay=0.05):
+    """Add a new allocation (name, start_value, increment) to the state doc.
+    We use optimistic concurrency: read current DB state, compute current values, append new item,
+    and try to atomically update only if last_timestamp unchanged. Retry on conflict.
+    """
+    if not name or name.strip() == "":
+        return False, "Name cannot be empty."
+    name = str(name).strip()
+    # check for duplicate name
+    doc0 = get_state_doc()
+    if doc0 and name in doc0.get("names", []):
+        return False, f"An allocation named '{name}' already exists."
+
+    for attempt in range(max_retries):
+        doc = get_state_doc()
+        if not doc:
+            return False, "State document missing while adding allocation."
+
+        db_ts = to_naive(doc.get("last_timestamp"))
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        current_vals = compute_current_values(doc["base_values"], doc.get("increments", []), db_ts, at_time=now)
+
+        # append new allocation with start_value as the current base (so the current value at 'now' equals start_value)
+        new_bases = current_vals + [float(start_value)]
+        new_incs = doc.get("increments", []) + [float(increment)]
+        new_names = doc.get("names", []) + [name]
+
+        res = col.update_one(
+            {"_id": STATE_DOC_ID, "last_timestamp": db_ts},
+            {"$set": {
+                "base_values": new_bases,
+                "increments": new_incs,
+                "names": new_names,
+                "last_timestamp": now
+            }}
+        )
+        if res.modified_count == 1:
+            # success -> update session_state
+            st.session_state.base_values = new_bases
+            st.session_state.increments = new_incs
+            st.session_state.var_names = new_names
+            st.session_state.last_timestamp = now
+            st.session_state.render_time = now
+            st.session_state.current_values_rendered = new_bases.copy()
+            return True, f"Allocation '{name}' added successfully."
+        time_module.sleep(retry_delay)
+
+    return False, "Failed to add allocation after multiple retries; please try again."
+
+# ---------- Update allocation (new) ----------
+def update_allocation(index: int, new_name: str, new_current_value: float, new_increment: float, max_retries=8, retry_delay=0.05):
+    """
+    Update allocation at `index`:
+    - new_name: new label (must not duplicate another existing name unless same index)
+    - new_current_value: the desired current value at 'now' (we set the base to that value)
+    - new_increment: new increment per second
+    Uses optimistic concurrency with retries.
+    """
+    if index < 0:
+        return False, "Invalid index."
+    new_name = str(new_name).strip()
+    if new_name == "":
+        return False, "Name cannot be empty."
+
+    for attempt in range(max_retries):
+        doc = get_state_doc()
+        if not doc:
+            return False, "State document missing while updating."
+
+        names = doc.get("names", [])
+        base = doc.get("base_values", [])
+        incs = doc.get("increments", [])
+        db_ts = to_naive(doc.get("last_timestamp"))
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        # duplicate name check (allow if same index)
+        if new_name in names and names.index(new_name) != index:
+            return False, f"Another allocation named '{new_name}' already exists."
+
+        # compute current values at now
+        current_vals = compute_current_values(base, incs, db_ts, at_time=now)
+
+        # build new arrays
+        new_bases = current_vals.copy()
+        # set the selected allocation's base so its current value at now equals new_current_value
+        new_bases[index] = float(new_current_value)
+
+        new_incs = incs.copy()
+        # if increments array shorter/padded, ensure length
+        if len(new_incs) < len(new_bases):
+            new_incs = new_incs + [0.0] * (len(new_bases) - len(new_incs))
+        new_incs[index] = float(new_increment)
+
+        new_names = names.copy()
+        # if names array shorter/padded, ensure length
+        if len(new_names) < len(new_bases):
+            new_names = new_names + [f"Var {i}" for i in range(len(new_names), len(new_bases))]
+        new_names[index] = new_name
+
+        res = col.update_one(
+            {"_id": STATE_DOC_ID, "last_timestamp": db_ts},
+            {"$set": {
+                "base_values": new_bases,
+                "increments": new_incs,
+                "names": new_names,
+                "last_timestamp": now
+            }}
+        )
+        if res.modified_count == 1:
+            # success: update session state
+            st.session_state.base_values = new_bases
+            st.session_state.increments = new_incs
+            st.session_state.var_names = new_names
+            st.session_state.last_timestamp = now
+            st.session_state.render_time = now
+            st.session_state.current_values_rendered = new_bases.copy()
+            return True, f"Allocation '{new_name}' updated."
+        time_module.sleep(retry_delay)
+
+    return False, "Failed to update allocation after multiple retries; please try again."
+
+# ---------- Delete allocation (new) ----------
+def delete_allocation(index: int, max_retries=8, retry_delay=0.05):
+    """
+    Remove allocation at `index` from names/base_values/increments.
+    Uses optimistic concurrency and retries.
+    """
+    if index < 0:
+        return False, "Invalid index."
+
+    for attempt in range(max_retries):
+        doc = get_state_doc()
+        if not doc:
+            return False, "State document missing while deleting."
+
+        names = doc.get("names", [])
+        base = doc.get("base_values", [])
+        incs = doc.get("increments", [])
+        db_ts = to_naive(doc.get("last_timestamp"))
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        if index >= len(names):
+            return False, "Index out of range."
+
+        # compute current values at now
+        current_vals = compute_current_values(base, incs, db_ts, at_time=now)
+
+        # remove index
+        new_bases = current_vals[:index] + current_vals[index+1:]
+        new_incs = incs[:index] + incs[index+1:]
+        new_names = names[:index] + names[index+1:]
+
+        res = col.update_one(
+            {"_id": STATE_DOC_ID, "last_timestamp": db_ts},
+            {"$set": {
+                "base_values": new_bases,
+                "increments": new_incs,
+                "names": new_names,
+                "last_timestamp": now
+            }}
+        )
+        if res.modified_count == 1:
+            # success: update session state
+            st.session_state.base_values = new_bases
+            st.session_state.increments = new_incs
+            st.session_state.var_names = new_names
+            st.session_state.last_timestamp = now
+            st.session_state.render_time = now
+            st.session_state.current_values_rendered = new_bases.copy()
+            return True, "Allocation deleted."
+        time_module.sleep(retry_delay)
+
+    return False, "Failed to delete allocation after multiple retries; please try again."
 
 # ======================================================================
 #                            AUTHENTICATION (UPDATED & ROBUST)
@@ -298,6 +511,7 @@ if "db_loaded" not in st.session_state:
     st.session_state.base_values = [float(x) for x in doc["base_values"]]
     st.session_state.increments = [float(x) for x in doc.get("increments", INCREMENTS)]
     st.session_state.last_timestamp = last_ts
+    st.session_state.var_names = doc.get("names", VAR_NAMES.copy())
 
     # compute one render snapshot (one DB read + compute)
     now_render = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -313,31 +527,28 @@ if "db_loaded" not in st.session_state:
     st.session_state.db_loaded = True
     st.session_state.last_action_msg = ""
     st.session_state.subtract_amt = 0.0
-    st.session_state.subtract_select = VAR_NAMES[0]
-
+    # ensure there's a sensible default selected allocation
+    st.session_state.subtract_select = st.session_state.var_names[0] if st.session_state.var_names else ""
 # Defensive: ensure increments length is correct
-if len(st.session_state.increments) != len(VAR_NAMES):
-    st.session_state.increments = INCREMENTS.copy()
+if len(st.session_state.increments) != len(st.session_state.var_names):
+    # if mismatch, align increments to names length by padding with zeros or trimming
+    target = len(st.session_state.var_names)
+    incs = st.session_state.increments
+    if len(incs) < target:
+        incs = incs + [0.0] * (target - len(incs))
+    else:
+        incs = incs[:target]
+    st.session_state.increments = incs
 
 # Initialize UI helper state
 st.session_state.setdefault("busy", False)
 st.session_state.setdefault("subtract_result", None)  # will hold dict {"ok":bool,"msg":str}
 
 # ---------- UI ----------
-# st.title("Live incrementing variables (local MongoDB persistence)")
 st.title("Live Expense allocations")
-# st.caption("State persists to local MongoDB. On reload/restart values are reconstructed from DB + elapsed time.")
 
 if cfg_err:
     st.warning("Config warning: " + str(cfg_err))
-
-# if st.button("Reload local config (does not overwrite DB state)"):
-#     cfg2, cfg_err2 = load_config()
-#     if cfg_err2:
-#         st.warning(cfg_err2)
-#     else:
-#         st.success("Config reloaded (UI labels/inc rates updated if changed in config.json).")
-#     st.session_state.increments = [float(x) for x in cfg2.get("INCREMENTS", INCREMENTS)]
 
 # Recompute display values based on the stored render snapshot (no DB read)
 now_render = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -349,12 +560,16 @@ current_values = [val + inc * elapsed_since_render
 payload = {
     "vars": [
         {"name": name, "value_at_render": float(val), "inc": float(inc)}
-        for name, val, inc in zip(VAR_NAMES, current_values, st.session_state.increments)
+        for name, val, inc in zip(st.session_state.var_names, current_values, st.session_state.increments)
     ],
     "updates_per_second": UPDATES_PER_SECOND,
     "decimals": DECIMALS,
     "paused": False
 }
+
+# -------------------- Renderer (same as before, but dynamic height & container clear) --------------------
+num_vars = len(st.session_state.var_names)
+calculated_height = max(360, min(1200, 80 * num_vars))  # ~80px per row, clamped
 
 html = f"""
 <div id="live-root" style="font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial;">
@@ -374,12 +589,15 @@ html = f"""
 (function(){{
   const payload = {json.dumps(payload)};
   const container = document.getElementById('vars');
+
+  // clear previous contents before rebuilding (important on reruns)
+  container.innerHTML = '';
+
   const decimals = payload.decimals || 4;
   const ups = Math.max(1, payload.updates_per_second || 10);
   const interval_ms = Math.round(1000 / ups);
 
   payload.vars.forEach((v, idx) => {{
-    // Insert a separator gap before the 4th (idx===3) and 5th (idx===4) rows
     if (idx === 3 || idx === 4) {{
       const sep = document.createElement('div');
       sep.className = 'separator';
@@ -394,16 +612,13 @@ html = f"""
     name.className = 'var-name';
     name.innerText = v.name;
 
-    // First three variables -> brown name
     if (idx < 3) {{
       name.classList.add('brown');
     }}
 
-    // For the 4th variable, highlight the substring "Dudu" in brown if present
     if (idx === 3) {{
       const special = "Dudu";
       if (name.innerText.includes(special)) {{
-        // replace only the first occurrence (that's fine for typical names)
         name.innerHTML = name.innerText.replace(special, `<span class="brown">${{special}}</span>`);
       }}
     }}
@@ -429,6 +644,7 @@ html = f"""
     const dt = (performance.now() - perfStart) / 1000.0;
     payload.vars.forEach((v, idx) => {{
       const row = document.getElementById('var-row-' + idx);
+      if (!row) return;
       const d = row._data;
       const current = d.value_at_render + d.inc * dt;
       const el = document.getElementById('var-value-' + idx);
@@ -438,35 +654,34 @@ html = f"""
 
   updateAll();
   if (window.__live_vars_interval) clearInterval(window.__live_vars_interval);
-  window.__live_vars_interval = setInterval(updateAll, interval_ms);
+  window.__live_vars_interval = setInterval(updateAll, Math.max(1, Math.round(1000 / (payload.updates_per_second || 10))));
 }})();
 </script>
 """
 
-components.html(html, height=360, scrolling=False)
+components.html(html, height=calculated_height, scrolling=True)
 
 st.markdown("---")
 
-# === Subtraction UI (callback-based, show feedback only after DB confirmation) ===
-# st.subheader("Subtract from a variable")
+# === Subtraction UI (unchanged) ===
 st.subheader("Subtract from the Expense allocations:")
 
 col_sel, col_amt, col_btn = st.columns([2, 2, 1])
 with col_sel:
-    sel = st.selectbox("Choose variable", VAR_NAMES, index=VAR_NAMES.index(st.session_state.subtract_select))
+    sel = st.selectbox("Choose variable", st.session_state.var_names, index=st.session_state.var_names.index(st.session_state.subtract_select) if st.session_state.subtract_select in st.session_state.var_names else 0)
     st.session_state.subtract_select = sel
 
 with col_amt:
     amt = st.number_input("Amount to subtract", format="%.6f", step=1.0, value=float(st.session_state.get("subtract_amt", 0.0)))
     st.session_state.subtract_amt = float(amt)
 
-# callback for button:
+# callback for subtract button:
 def do_subtract_callback():
     """Runs only when button clicked. Sets subtract_result in session_state."""
     st.session_state["busy"] = True
     st.session_state["subtract_result"] = None
     try:
-        idx = VAR_NAMES.index(st.session_state.subtract_select)
+        idx = st.session_state.var_names.index(st.session_state.subtract_select)
         amount = float(st.session_state.subtract_amt)
         if amount == 0.0:
             st.session_state["subtract_result"] = {"ok": False, "msg": "Enter a non-zero amount to subtract."}
@@ -483,9 +698,7 @@ def do_subtract_callback():
     finally:
         st.session_state["busy"] = False
 
-# disable button if amount == 0 or busy
 disable_btn = (st.session_state.get("subtract_amt", 0.0) == 0.0) or st.session_state.get("busy", False)
-
 st.button("Subtract", key="subtract_btn", on_click=do_subtract_callback, disabled=disable_btn)
 
 # Show result only from session_state (guaranteed to reflect real DB outcome)
@@ -496,9 +709,113 @@ if res is not None:
     else:
         st.error(res.get("msg"))
 
+st.markdown("---")
+
+# === Add Allocation UI (unchanged) ===
+st.subheader("Add new allocation (name, start value, increment per second)")
+
+add_col1, add_col2, add_col3 = st.columns([2, 1, 1])
+with add_col1:
+    new_name = st.text_input("Allocation name", value="")
+with add_col2:
+    new_start = st.number_input("Start value", value=0.0, format="%.6f", step=1.0)
+with add_col3:
+    new_inc = st.number_input("Increment (per second)", value=0.1, format="%.6f", step=0.01)
+
+def do_add_allocation():
+    st.session_state["busy"] = True
+    try:
+        ok, msg = add_allocation(new_name, float(new_start), float(new_inc))
+        if ok:
+            st.success(msg)
+        else:
+            st.error(msg)
+    except Exception as e:
+        st.error(f"Exception adding allocation: {e}")
+    finally:
+        st.session_state["busy"] = False
+
+st.button("Add allocation", on_click=do_add_allocation, disabled=st.session_state.get("busy", False))
+st.markdown("---")
+
+# === Edit Allocation UI (NEW) ===
+st.subheader("Edit selected allocation")
+
+if st.session_state.var_names:
+    edit_col1, edit_col2 = st.columns([2, 1])
+    with edit_col1:
+        edit_sel = st.selectbox("Select allocation to edit", st.session_state.var_names, key="edit_select")
+        edit_idx = st.session_state.var_names.index(edit_sel)
+    # show current computed value and editable fields
+    current_val = current_values[edit_idx] if edit_idx < len(current_values) else 0.0
+    with edit_col2:
+        st.write(f"Current value: **{current_val:.6f}**")
+    # Prefill editable fields with current data
+    col_a, col_b = st.columns([2, 1])
+    with col_a:
+        edit_name = st.text_input("Name", value=st.session_state.var_names[edit_idx], key="edit_name")
+    with col_b:
+        edit_inc = st.number_input("Increment (per second)", value=float(st.session_state.increments[edit_idx]), format="%.6f", step=0.01, key="edit_inc")
+
+    # control for setting current value (interpreted as value at the moment of pressing Save)
+    set_val_col1, set_val_col2 = st.columns([2, 1])
+    with set_val_col1:
+        edit_value = st.number_input("Set current value (value at now)", value=float(current_val), format="%.6f", step=1.0, key="edit_value")
+    with set_val_col2:
+        st.write("")  # spacer
+
+    # Save button
+    def do_save_edit():
+        st.session_state["busy"] = True
+        try:
+            ok, msg = update_allocation(edit_idx, edit_name, float(edit_value), float(edit_inc))
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+        except Exception as e:
+            st.error(f"Exception saving allocation: {e}")
+        finally:
+            st.session_state["busy"] = False
+
+    st.button("Save changes", on_click=do_save_edit, disabled=st.session_state.get("busy", False))
+
+    # Delete controls (require explicit confirmation checkbox)
+    st.markdown("**Danger zone:** delete this allocation")
+    del_col1, del_col2 = st.columns([3, 1])
+    with del_col1:
+        confirm_delete = st.checkbox("I confirm I want to delete this allocation", key="confirm_delete")
+    with del_col2:
+        def do_delete():
+            st.session_state["busy"] = True
+            try:
+                ok, msg = delete_allocation(edit_idx)
+                if ok:
+                    st.success(msg)
+                    # reset confirm checkbox
+                    st.session_state.confirm_delete = False
+                else:
+                    st.error(msg)
+            except Exception as e:
+                st.error(f"Exception deleting allocation: {e}")
+            finally:
+                st.session_state["busy"] = False
+        st.button("Delete", on_click=do_delete, disabled=(not st.session_state.get("confirm_delete", False) or st.session_state.get("busy", False)))
+else:
+    st.info("No allocations available to edit.")
+
+st.markdown("---")
+
 # Helpful info
+st.subheader("Fixed monthly allocations, that are already deducted, and can be used only once every month:")
+st.write("Gym Fees(that goes to pupuu): 1083.33")
+st.write("Nayabad: 500")
+st.write("Recharge: 189")
+
+st.markdown("---")
+
 st.write(f"Last DB save timestamp (UTC, naive): {st.session_state.last_timestamp.isoformat()}")
-st.write("Note: display uses a cached render snapshot and applies increments since that snapshot. On successful subtraction the DB is updated atomically.")
+st.write("Note: display uses a cached render snapshot and applies increments since that snapshot. On successful subtraction or addition or edit the DB is updated atomically.")
 
 st.markdown("---")
 st.write("To migrate to MongoDB Atlas later, change the MONGO_URI at the top to your Atlas connection string.")
