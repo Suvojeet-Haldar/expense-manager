@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import time as time_module
 import streamlit as st
 import streamlit.components.v1 as components
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 
 # NEW: auth imports
 import yaml
@@ -80,6 +80,13 @@ COLLECTION_NAME = "state"
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 col = db[COLLECTION_NAME]
+
+# --- LOGS ADDED ---
+LOGS_COLLECTION_NAME = "logs"
+col_logs = db[LOGS_COLLECTION_NAME]
+# counters collection for transaction numbers
+counters_col = db["counters"]
+# --- /LOGS ADDED ---
 
 STATE_DOC_ID = "live_state"  # fixed _id for single-state document
 
@@ -404,6 +411,18 @@ def delete_allocation(index: int, max_retries=8, retry_delay=0.05):
 
     return False, "Failed to delete allocation after multiple retries; please try again."
 
+# Helper: get next transaction id (atomic increment)
+def next_tx_id():
+    """Atomically increment and return the next transaction id."""
+    doc = counters_col.find_one_and_update(
+        {"_id": "tx_counter"},
+        {"$inc": {"value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+    # doc should always contain "value" after update
+    return int(doc.get("value", 0))
+
 # ======================================================================
 #                            AUTHENTICATION (UPDATED & ROBUST)
 # ======================================================================
@@ -526,7 +545,8 @@ if "db_loaded" not in st.session_state:
 
     st.session_state.db_loaded = True
     st.session_state.last_action_msg = ""
-    st.session_state.subtract_amt = 0.0
+    # use a distinct key for the UI number input to avoid races
+    st.session_state.subtract_amt_input = 0.0
     # ensure there's a sensible default selected allocation
     st.session_state.subtract_select = st.session_state.var_names[0] if st.session_state.var_names else ""
 # Defensive: ensure increments length is correct
@@ -543,9 +563,14 @@ if len(st.session_state.increments) != len(st.session_state.var_names):
 # Initialize UI helper state
 st.session_state.setdefault("busy", False)
 st.session_state.setdefault("subtract_result", None)  # will hold dict {"ok":bool,"msg":str}
+# --- LOGS ADDED: store note in session_state default
+st.session_state.setdefault("subtract_note", "")
+# --- /LOGS ADDED
 
 # ---------- UI ----------
 st.title("Live Expense allocations")
+
+st.markdown("---")
 
 if cfg_err:
     st.warning("Config warning: " + str(cfg_err))
@@ -569,7 +594,8 @@ payload = {
 
 # -------------------- Renderer (same as before, but dynamic height & container clear) --------------------
 num_vars = len(st.session_state.var_names)
-calculated_height = max(360, min(1200, 80 * num_vars))  # ~80px per row, clamped
+# calculated_height = max(360, min(1200, 80 * num_vars))  # ~80px per row, clamped
+calculated_height = max(280, min(900, 60 * num_vars))  # ~60px per row, clamped tighter
 
 html = f"""
 <div id="live-root" style="font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial;">
@@ -663,43 +689,104 @@ components.html(html, height=calculated_height, scrolling=True)
 
 st.markdown("---")
 
-# === Subtraction UI (unchanged) ===
+# === Subtraction UI (aligned: select, amount, button in one row) ===
 st.subheader("Subtract from the Expense allocations:")
 
 col_sel, col_amt, col_btn = st.columns([2, 2, 1])
 with col_sel:
-    sel = st.selectbox("Choose variable", st.session_state.var_names, index=st.session_state.var_names.index(st.session_state.subtract_select) if st.session_state.subtract_select in st.session_state.var_names else 0)
+    sel = st.selectbox(
+        "Choose variable",
+        st.session_state.var_names,
+        index=st.session_state.var_names.index(st.session_state.subtract_select) if st.session_state.subtract_select in st.session_state.var_names else 0
+    )
     st.session_state.subtract_select = sel
 
+# Bind the number input to a stable session_state key to avoid race conditions.
 with col_amt:
-    amt = st.number_input("Amount to subtract", format="%.6f", step=1.0, value=float(st.session_state.get("subtract_amt", 0.0)))
-    st.session_state.subtract_amt = float(amt)
+    # use a session_state-backed key so clearing in the callback is immediate and persistent
+    amt = st.number_input(
+        "Amount to subtract",
+        format="%.6f",
+        step=1.0,
+        value=float(st.session_state.get("subtract_amt_input", 0.0)),
+        key="subtract_amt_input"
+    )
 
-# callback for subtract button:
-def do_subtract_callback():
-    """Runs only when button clicked. Sets subtract_result in session_state."""
+# Callback now receives the exact values as args (no reliance on reading st.session_state inside callback).
+def do_subtract_callback(selected_var, amount, note_val):
+    """Runs only when button clicked. Uses the passed-in amount to avoid session_state race."""
     st.session_state["busy"] = True
     st.session_state["subtract_result"] = None
     try:
-        idx = st.session_state.var_names.index(st.session_state.subtract_select)
-        amount = float(st.session_state.subtract_amt)
+        # find index at time of click (use selection passed as arg)
+        try:
+            idx = st.session_state.var_names.index(selected_var)
+        except Exception:
+            # fallback: recompute based on current selection
+            idx = st.session_state.var_names.index(st.session_state.get("subtract_select", st.session_state.var_names[0]))
+        amount = float(amount)
         if amount == 0.0:
             st.session_state["subtract_result"] = {"ok": False, "msg": "Enter a non-zero amount to subtract."}
             return
         ok, message = subtract_optimized(idx, amount)
         if ok:
-            # confirmed success -> clear input amount only now
-            st.session_state.subtract_amt = 0.0
+            # confirmed success -> clear input amount in session state (this will reset the widget)
+            st.session_state["subtract_amt_input"] = 0.0
+
+            # --- LOGS ADDED: insert log into logs collection with an atomic tx id ---
+            try:
+                now_log = datetime.now(timezone.utc).replace(tzinfo=None)
+                tx_id = next_tx_id()
+                log_doc = {
+                    "timestamp": now_log,
+                    "tx": int(tx_id),
+                    "var_index": idx,
+                    "var_name": st.session_state.var_names[idx],
+                    "amount": float(amount),
+                    "note": str(note_val) if note_val is not None else "",
+                    "user": username if 'username' in globals() and username else st.session_state.get("username", "")
+                }
+                col_logs.insert_one(log_doc)
+                # clear note after successful save
+                st.session_state["subtract_note"] = ""
+            except Exception as e:
+                message = f"{message} (Note not saved: {e})"
+            # --- /LOGS ADDED ---
+
             st.session_state["subtract_result"] = {"ok": True, "msg": message}
         else:
             st.session_state["subtract_result"] = {"ok": False, "msg": message}
     except Exception as e:
         st.session_state["subtract_result"] = {"ok": False, "msg": f"Exception: {e}"}
     finally:
+        # Ensure inputs are cleared every time the button callback finishes
+        st.session_state["subtract_amt_input"] = 0.0
+        st.session_state["subtract_note"] = ""
         st.session_state["busy"] = False
 
-disable_btn = (st.session_state.get("subtract_amt", 0.0) == 0.0) or st.session_state.get("busy", False)
-st.button("Subtract", key="subtract_btn", on_click=do_subtract_callback, disabled=disable_btn)
+# place the button inside the third column so it's aligned with the select and number input
+disable_btn = (float(st.session_state.get("subtract_amt_input", 0.0)) == 0.0) or st.session_state.get("busy", False)
+with col_btn:
+    # Pass the widget values as args to avoid callback reading stale session_state values.
+    st.button(
+        "Subtract",
+        key="subtract_btn",
+        on_click=do_subtract_callback,
+        args=(sel, float(st.session_state.get("subtract_amt_input", 0.0)), st.session_state.get("subtract_note", "")),
+        disabled=disable_btn
+    )
+
+# --- LOGS ADDED: Note input for subtraction (multiline optional) ---
+# placed below the column row to avoid changing the existing column layout
+note = st.text_area(
+    "Note (optional)",
+    value=st.session_state.get("subtract_note", ""),
+    height=80,
+    help="Optional note to store with the subtraction (appears in logs)."
+)
+# keep bound to session state
+st.session_state["subtract_note"] = note
+# --- /LOGS ADDED ---
 
 # Show result only from session_state (guaranteed to reflect real DB outcome)
 res = st.session_state.get("subtract_result")
@@ -708,6 +795,71 @@ if res is not None:
         st.success(res.get("msg"))
     else:
         st.error(res.get("msg"))
+
+# --- LOGS ADDED: display subtraction logs (now scrollable, show max 5 visible at once) ---
+st.markdown("---")
+st.subheader("Subtraction logs (most recent first)")
+
+# Helper to escape HTML inside log strings
+def _html_escape(s):
+    if s is None:
+        return ""
+    s = str(s)
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+         .replace("'", "&#39;")
+    )
+
+try:
+    # fetch last 20 logs (same as before) but render inside a scrollable container limited to ~5 visible items
+    cursor = col_logs.find().sort("timestamp", -1).limit(20)
+    logs = list(cursor)
+    if logs:
+        entries_html = ""
+        for lg in logs:
+            ts = to_naive(lg.get("timestamp"))
+            ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+            tx = lg.get("tx", "")
+            varn = lg.get("var_name", f"Idx {lg.get('var_index')}")
+            amt = lg.get("amount", "")
+            usr = lg.get("user", "")
+            note_txt = lg.get("note", "")
+
+            # escape to avoid injecting HTML
+            ts_html = _html_escape(ts_str)
+            tx_html = _html_escape(tx)
+            varn_html = _html_escape(varn)
+            amt_html = _html_escape(amt)
+            usr_html = _html_escape(usr)
+            note_html = _html_escape(note_txt)
+
+            # Build each log item: tx + header line and optional note line
+            entries_html += (
+                "<div class='log-item'>"
+                f"<div class='log-header'>#{tx_html} &nbsp; <strong>{ts_html}</strong> &mdash; {varn_html} &mdash; {amt_html} &mdash; {usr_html}</div>"
+            )
+            if note_html:
+                entries_html += f"<div class='log-note'>&nbsp;&nbsp;{note_html}</div>"
+            entries_html += "</div>"
+        # Container CSS: limit visible height to ~5 items, allow scrolling to view older logs
+        container_html = (
+            "<style>"
+            "  .logs-container { max-height: 260px; overflow-y: auto; padding: 6px 8px; border-radius: 6px; }"
+            "  .log-item { padding: 8px 6px; border-bottom: 1px solid rgba(255,255,255,0.03); }"
+            "  .log-header { font-size: 14px; line-height: 1.2; }"
+            "  .log-note { margin-top: 6px; margin-left: 6px; color: #cfcfcf; font-size: 13px; white-space: pre-wrap; }"
+            "</style>"
+            f"<div class='logs-container'>{entries_html}</div>"
+        )
+        st.markdown(container_html, unsafe_allow_html=True)
+    else:
+        st.info("No subtraction logs yet.")
+except Exception as e:
+    st.error(f"Could not load subtraction logs: {e}")
+# --- /LOGS ADDED ---
 
 st.markdown("---")
 
