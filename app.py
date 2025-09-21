@@ -2,7 +2,7 @@
 import time
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import time as time_module
 import streamlit as st
 import streamlit.components.v1 as components
@@ -800,9 +800,12 @@ if res is not None:
     else:
         st.error(res.get("msg"))
 
-# --- LOGS ADDED: display subtraction logs (now scrollable, show max 5 visible at once) ---
+# --- LOGS ADDED: display subtraction logs (now fetch ALL and allow scrolling to earliest) ---
 st.markdown("---")
 st.subheader("Subtraction logs (most recent first)")
+
+st.info("Log date-time here may vary from db since, this is in IST and in db it is in UTC.")
+
 
 # Helper to escape HTML inside log strings
 def _html_escape(s):
@@ -817,15 +820,31 @@ def _html_escape(s):
          .replace("'", "&#39;")
     )
 
+def _to_ist_string(naive_utc_dt):
+    """Convert naive UTC datetime to IST (UTC+05:30) string."""
+    try:
+        if naive_utc_dt is None:
+            return ""
+        # ensure naive -> treat as UTC
+        dt_utc = to_naive(naive_utc_dt)
+        ist_dt = dt_utc + timedelta(hours=5, minutes=30)
+        return ist_dt.isoformat()
+    except Exception:
+        try:
+            return str(naive_utc_dt)
+        except Exception:
+            return ""
+
 try:
-    # fetch last 20 logs (same as before) but render inside a scrollable container limited to ~5 visible items
-    cursor = col_logs.find().sort("timestamp", -1).limit(20)
+    # fetch ALL logs sorted most-recent-first (no limit) so scrolling can reach earliest transactions
+    cursor = col_logs.find().sort("timestamp", -1)
     logs = list(cursor)
     if logs:
         entries_html = ""
         for lg in logs:
             ts = to_naive(lg.get("timestamp"))
-            ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+            # show IST user-friendly timestamp
+            ts_str_ist = _to_ist_string(ts)
             tx = lg.get("tx", "")
             varn = lg.get("var_name", f"Idx {lg.get('var_index')}")
             amt = lg.get("amount", "")
@@ -833,7 +852,7 @@ try:
             note_txt = lg.get("note", "")
 
             # escape to avoid injecting HTML
-            ts_html = _html_escape(ts_str)
+            ts_html = _html_escape(ts_str_ist)
             tx_html = _html_escape(tx)
             varn_html = _html_escape(varn)
             amt_html = _html_escape(amt)
@@ -848,10 +867,10 @@ try:
             if note_html:
                 entries_html += f"<div class='log-note'>&nbsp;&nbsp;{note_html}</div>"
             entries_html += "</div>"
-        # Container CSS: limit visible height to ~5 items, allow scrolling to view older logs
+        # Container CSS: allow scrolling to view ALL older logs
         container_html = (
             "<style>"
-            "  .logs-container { max-height: 260px; overflow-y: auto; padding: 6px 8px; border-radius: 6px; }"
+            "  .logs-container { max-height: 400px; overflow-y: auto; padding: 6px 8px; border-radius: 6px; }"
             "  .log-item { padding: 8px 6px; border-bottom: 1px solid rgba(255,255,255,0.03); }"
             "  .log-header { font-size: 14px; line-height: 1.2; }"
             "  .log-note { margin-top: 6px; margin-left: 6px; color: #cfcfcf; font-size: 13px; white-space: pre-wrap; }"
@@ -864,6 +883,73 @@ try:
 except Exception as e:
     st.error(f"Could not load subtraction logs: {e}")
 # --- /LOGS ADDED ---
+
+# === Edit log note UI (new) ===
+st.markdown("---")
+st.subheader("Edit a log's note")
+
+try:
+    # fetch tx list (descending) to populate selectbox
+    cursor2 = col_logs.find().sort("timestamp", -1)
+    logs_for_select = list(cursor2)
+    if logs_for_select:
+        # options: show tx and a short label
+        select_options = [
+            (lg.get("tx", ""), f"#{lg.get('tx', '')} — { _to_ist_string(to_naive(lg.get('timestamp'))) } — {lg.get('var_name','')}")
+            for lg in logs_for_select
+        ]
+        # build mapping and separate lists for selectbox
+        tx_values = [opt[0] for opt in select_options]
+        tx_labels = [opt[1] for opt in select_options]
+
+        sel_index = 0
+        # try to maintain a previous selection if present
+        prev_sel = st.session_state.get("edit_selected_tx", None)
+        if prev_sel is not None and prev_sel in tx_values:
+            sel_index = tx_values.index(prev_sel)
+
+        chosen_label = st.selectbox("Choose transaction to edit", options=tx_labels, index=sel_index)
+        chosen_tx = tx_values[tx_labels.index(chosen_label)]
+        st.session_state["edit_selected_tx"] = chosen_tx
+
+        # Prefill the text area with current note from DB
+        doc = col_logs.find_one({"tx": chosen_tx})
+        current_note = ""
+        if doc:
+            current_note = doc.get("note", "")
+
+        edit_key = f"edit_note_{chosen_tx}"
+        # Initialize session_state key if not present so widget keeps stable value
+        if edit_key not in st.session_state:
+            st.session_state[edit_key] = current_note
+
+        new_note = st.text_area("Edit note for selected transaction", value=st.session_state.get(edit_key, ""), key=edit_key, height=120)
+
+        def save_log_note(tx_id):
+            st.session_state.setdefault("busy", True)
+            try:
+                key = f"edit_note_{tx_id}"
+                note_val = st.session_state.get(key, "")
+                # Update the log document by tx (tx assumed unique)
+                res = col_logs.update_one({"tx": int(tx_id)}, {"$set": {"note": str(note_val)}})
+                if res.matched_count == 0:
+                    st.error("Could not find the selected transaction to update.")
+                else:
+                    st.success(f"Updated note for transaction #{tx_id}.")
+                    # clear local edit field if desired (keep it consistent with DB)
+                    st.session_state[key] = str(note_val)
+                    # Force a quick refresh of logs display via re-run (Streamlit reruns automatically on state change).
+            except Exception as e:
+                st.error(f"Error updating log note: {e}")
+            finally:
+                st.session_state["busy"] = False
+
+        st.button("Save note", on_click=save_log_note, args=(chosen_tx,), disabled=st.session_state.get("busy", False))
+
+    else:
+        st.info("No logs available to edit yet.")
+except Exception as e:
+    st.error(f"Could not load logs for editing: {e}")
 
 st.markdown("---")
 
@@ -963,10 +1049,14 @@ else:
 st.markdown("---")
 
 # Helpful info
-st.subheader("Fixed monthly allocations, that are already deducted, and can be used only once every month:")
-st.write("Gym Fees(that goes to pupuu): 1083.33")
-st.write("Nayabad: 500")
-st.write("Recharge: 189")
+# st.subheader("Fixed monthly allocations, that are already deducted, and can be used only once every month:")
+# st.write("Gym Fees(that goes to pupuu): 1083.33")
+# st.write("Nayabad: 500")
+# st.write("Recharge: 189")
+st.info("""Fixed monthly allocations, that are already deducted, and can be used only once every month:\n
+        Gym Fees(that goes to pupuu): 1083.33
+        Nayabad: 500
+        Recharge: 189""")
 
 st.markdown("---")
 
