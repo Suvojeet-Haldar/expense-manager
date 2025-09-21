@@ -712,9 +712,23 @@ with col_amt:
         key="subtract_amt_input"
     )
 
-# Callback now receives the exact values as args (no reliance on reading st.session_state inside callback).
-def do_subtract_callback(selected_var, amount, note_val):
-    """Runs only when button clicked. Uses the passed-in amount to avoid session_state race."""
+# --- LOGS ADDED: Note input for subtraction (multiline optional) ---
+# placed below the column row to avoid changing the existing column layout
+note = st.text_area(
+    "Note (optional)",
+    value=st.session_state.get("subtract_note", ""),
+    height=80,
+    help="Optional note to store with the subtraction (appears in logs)."
+)
+# keep bound to session state
+st.session_state["subtract_note"] = note
+# --- /LOGS ADDED ---
+
+# Callback now receives selection and amount as args.
+# The callback reads the note directly from st.session_state at runtime (so it can't be stale).
+def do_subtract_callback(selected_var, amount):
+    """Runs only when button clicked. Uses the passed-in amount to avoid session_state race,
+       but reads the note from session_state inside the callback to ensure it's the up-to-date value."""
     st.session_state["busy"] = True
     st.session_state["subtract_result"] = None
     try:
@@ -737,6 +751,8 @@ def do_subtract_callback(selected_var, amount, note_val):
             try:
                 now_log = datetime.now(timezone.utc).replace(tzinfo=None)
                 tx_id = next_tx_id()
+                # read the note from session_state at runtime (fixed: avoids stale capture)
+                note_val = st.session_state.get("subtract_note", "")
                 log_doc = {
                     "timestamp": now_log,
                     "tx": int(tx_id),
@@ -767,26 +783,14 @@ def do_subtract_callback(selected_var, amount, note_val):
 # place the button inside the third column so it's aligned with the select and number input
 disable_btn = (float(st.session_state.get("subtract_amt_input", 0.0)) == 0.0) or st.session_state.get("busy", False)
 with col_btn:
-    # Pass the widget values as args to avoid callback reading stale session_state values.
+    # Pass the widget values as args (note is NOT passed here; it is read inside the callback).
     st.button(
         "Subtract",
         key="subtract_btn",
         on_click=do_subtract_callback,
-        args=(sel, float(st.session_state.get("subtract_amt_input", 0.0)), st.session_state.get("subtract_note", "")),
+        args=(sel, float(st.session_state.get("subtract_amt_input", 0.0)),),
         disabled=disable_btn
     )
-
-# --- LOGS ADDED: Note input for subtraction (multiline optional) ---
-# placed below the column row to avoid changing the existing column layout
-note = st.text_area(
-    "Note (optional)",
-    value=st.session_state.get("subtract_note", ""),
-    height=80,
-    help="Optional note to store with the subtraction (appears in logs)."
-)
-# keep bound to session state
-st.session_state["subtract_note"] = note
-# --- /LOGS ADDED ---
 
 # Show result only from session_state (guaranteed to reflect real DB outcome)
 res = st.session_state.get("subtract_result")
