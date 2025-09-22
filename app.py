@@ -1,11 +1,15 @@
 import time
 import json
 import os
+from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
 import time as time_module
 import streamlit as st
 import streamlit.components.v1 as components
 from pymongo import MongoClient, ReturnDocument
+
+# load .env (if present)
+load_dotenv()
 
 # NEW: auth imports
 import yaml
@@ -72,7 +76,10 @@ if not (len(VAR_NAMES) == len(START_VALUES) == len(INCREMENTS)):
     cfg_err = (cfg_err or "") + " Config arrays had mismatched lengths; trimmed to shortest length."
 
 # ---------- MongoDB (local) ----------
-MONGO_URI = "mongodb://localhost:27017/"
+# MONGO_URI = "mongodb://localhost:27017/"
+# prefer env var, fall back to local
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+
 DB_NAME = "live_vars_db"
 COLLECTION_NAME = "state"
 

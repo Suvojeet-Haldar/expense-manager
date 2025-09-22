@@ -37,7 +37,7 @@ dist/
 *.egg-info/
 
 # Secrets / config files (DO NOT COMMIT)
-auth_config.yaml
+# auth_config.yaml
 auth_config.yml
 config.json
 secrets.toml
@@ -45,3 +45,5 @@ secrets.toml
 # Optional: lockfiles
 poetry.lock
 Pipfile.lock
+
+dump/

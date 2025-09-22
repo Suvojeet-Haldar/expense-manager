@@ -4,3 +4,4 @@ streamlit
 bcrypt
 streamlit-authenticator
 passlib[bcrypt]
+dnspython

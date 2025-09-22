@@ -1,0 +1,19 @@
+credentials:
+  usernames:
+    suvo:
+      email: suvojeethaldar4@gmail.com
+      name: Suvojeet Haldar
+      password: "$2b$12$klL1X1xVWWtuMZ7bJh2nzeDa6aUFyZQLMP3.ETHuTGBj1mbUPCcDW"  # bcrypt hash
+    guest:
+      email: guest@example.com
+      name: guest
+      password: "$2b$12$klL1X1xVWWtuMZ7bJh2nzeDa6aUFyZQLMP3.ETHuTGBj1mbUPCcDW"
+
+cookie:
+  name: expense_manager_auth
+  key: $2b$12$viaHCWvdfG/joCqOfX..puKNWc7eugIgRANYGFAUuErSy2PXOJySe$2b$12$1ASTxY8Q2TNBJ9YHUyM7V.tJ7ZsaVyQv1tuUfYYDVx1w50cMJQvmm       # change me
+  expiry_days: 30
+
+preauthorized:
+  emails:
+    - suvojeethaldar4@gmail.com
