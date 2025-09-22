@@ -1,8 +1,20 @@
-## Setup (local)
+---
+title: Live Expense Allocations
+emoji: 💰
+colorFrom: blue
+colorTo: green
+sdk: streamlit
+sdk_version: "1"
+app_file: app.py
+pinned: false
+---
 
-Create local config files from the provided examples (do NOT commit these):
+Live Expense Allocations — Streamlit app for tracking and allocating expenses.
 
-cp auth_config.example.yaml auth_config.yaml     # then edit locally: paste hashed passwords and a secret cookie key
-cp config.example.json config.json               # then edit locally if you need different start values
+This Space runs a Streamlit app (`app.py`).  
+Secrets (MongoDB URI, authenticator hashes, cookie key, etc.) are stored in the Space **Settings → Secrets**.
 
-Never commit `auth_config.yaml` or `config.json`. They are included in `.gitignore`.
+**How to run locally**
+```bash
+# set your local env vars or keep a local config for dev, then:
+streamlit run app.py
