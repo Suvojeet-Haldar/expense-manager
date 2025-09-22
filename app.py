@@ -1,4 +1,3 @@
-# app.py
 import time
 import json
 import os
@@ -177,6 +176,10 @@ def subtract_optimized(index, amount, max_retries=8, retry_delay=0.05):
     If fails due to concurrent update, fallback to read-and-retry loop.
     Returns (success:bool, message:str).
     """
+    # PERMISSION CHECK: read-only users cannot mutate
+    if str(st.session_state.get("username", "")).lower() == "guest":
+        return False, "Permission denied: read-only user."
+
     now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
     # use render snapshot if present
     render_time = to_naive(st.session_state.get("render_time", st.session_state.last_timestamp))
@@ -242,6 +245,10 @@ def add_allocation(name: str, start_value: float, increment: float, max_retries=
     We use optimistic concurrency: read current DB state, compute current values, append new item,
     and try to atomically update only if last_timestamp unchanged. Retry on conflict.
     """
+    # PERMISSION CHECK: read-only users cannot mutate
+    if str(st.session_state.get("username", "")).lower() == "guest":
+        return False, "Permission denied: read-only user."
+
     if not name or name.strip() == "":
         return False, "Name cannot be empty."
     name = str(name).strip()
@@ -295,6 +302,10 @@ def update_allocation(index: int, new_name: str, new_current_value: float, new_i
     - new_increment: new increment per second
     Uses optimistic concurrency with retries.
     """
+    # PERMISSION CHECK: read-only users cannot mutate
+    if str(st.session_state.get("username", "")).lower() == "guest":
+        return False, "Permission denied: read-only user."
+
     if index < 0:
         return False, "Invalid index."
     new_name = str(new_name).strip()
@@ -364,6 +375,10 @@ def delete_allocation(index: int, max_retries=8, retry_delay=0.05):
     Remove allocation at `index` from names/base_values/increments.
     Uses optimistic concurrency and retries.
     """
+    # PERMISSION CHECK: read-only users cannot mutate
+    if str(st.session_state.get("username", "")).lower() == "guest":
+        return False, "Permission denied: read-only user."
+
     if index < 0:
         return False, "Invalid index."
 
@@ -516,7 +531,15 @@ except TypeError:
         except Exception:
             pass
 
-st.sidebar.caption(f"Signed in as {name} ({username})")
+# Determine effective username reliably and store in session_state
+effective_username = username if ('username' in locals() and username) else st.session_state.get("username", "")
+st.session_state["username"] = effective_username
+st.session_state["display_name"] = name
+
+st.sidebar.caption(f"Signed in as {name} ({effective_username})")
+
+# Boolean flag for read-only guest
+is_guest = str(effective_username).lower() == "guest"
 
 # ======================================================================
 #                         MAIN APP (unchanged logic)
@@ -688,6 +711,100 @@ html = f"""
 components.html(html, height=calculated_height, scrolling=True)
 
 st.markdown("---")
+
+# If user is guest (read-only) show only allowed sections and stop further UI
+if is_guest:
+    st.info("You are signed in as read-only user 'guest'. You can **view** Live Expense allocations and logs only.")
+
+    # --- LOGS ADDED: display subtraction logs (now fetch ALL and allow scrolling to earliest) ---
+    st.subheader("Subtraction logs (most recent first)")
+    st.info("Log date-time here may vary from db since, this is in IST and in db it is in UTC.")
+
+    # Helper to escape HTML inside log strings
+    def _html_escape(s):
+        if s is None:
+            return ""
+        s = str(s)
+        return (
+            s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;")
+             .replace("'", "&#39;")
+        )
+
+    def _to_ist_string(naive_utc_dt):
+        """Convert naive UTC datetime to IST (UTC+05:30) string."""
+        try:
+            if naive_utc_dt is None:
+                return ""
+            # ensure naive -> treat as UTC
+            dt_utc = to_naive(naive_utc_dt)
+            ist_dt = dt_utc + timedelta(hours=5, minutes=30)
+            return ist_dt.isoformat()
+        except Exception:
+            try:
+                return str(naive_utc_dt)
+            except Exception:
+                return ""
+
+    try:
+        # fetch ALL logs sorted most-recent-first (no limit) so scrolling can reach earliest transactions
+        cursor = col_logs.find().sort("timestamp", -1)
+        logs = list(cursor)
+        if logs:
+            entries_html = ""
+            for lg in logs:
+                ts = to_naive(lg.get("timestamp"))
+                # show IST user-friendly timestamp
+                ts_str_ist = _to_ist_string(ts)
+                tx = lg.get("tx", "")
+                varn = lg.get("var_name", f"Idx {lg.get('var_index')}")
+                amt = lg.get("amount", "")
+                usr = lg.get("user", "")
+                note_txt = lg.get("note", "")
+
+                # escape to avoid injecting HTML
+                ts_html = _html_escape(ts_str_ist)
+                tx_html = _html_escape(tx)
+                varn_html = _html_escape(varn)
+                amt_html = _html_escape(amt)
+                usr_html = _html_escape(usr)
+                note_html = _html_escape(note_txt)
+
+                # Build each log item: tx + header line and optional note line
+                entries_html += (
+                    "<div class='log-item'>"
+                    f"<div class='log-header'>#{tx_html} &nbsp; <strong>{ts_html}</strong> &mdash; {varn_html} &mdash; {amt_html} &mdash; {usr_html}</div>"
+                )
+                if note_html:
+                    entries_html += f"<div class='log-note'>&nbsp;&nbsp;{note_html}</div>"
+                entries_html += "</div>"
+            # Container CSS: allow scrolling to view ALL older logs
+            container_html = (
+                "<style>"
+                "  .logs-container { max-height: 400px; overflow-y: auto; padding: 6px 8px; border-radius: 6px; }"
+                "  .log-item { padding: 8px 6px; border-bottom: 1px solid rgba(255,255,255,0.03); }"
+                "  .log-header { font-size: 14px; line-height: 1.2; }"
+                "  .log-note { margin-top: 6px; margin-left: 6px; color: #cfcfcf; font-size: 13px; white-space: pre-wrap; }"
+                "</style>"
+                f"<div class='logs-container'>{entries_html}</div>"
+            )
+            st.markdown(container_html, unsafe_allow_html=True)
+        else:
+            st.info("No subtraction logs yet.")
+    except Exception as e:
+        st.error(f"Could not load subtraction logs: {e}")
+    # --- /LOGS ADDED ---
+
+    st.markdown("---")
+    st.info("""Fixed monthly allocations, that are already deducted, and can be used only once every month:\n
+            Gym Fees(that goes to pupuu): 1083.33
+            Nayabad: 500
+            Recharge: 189""")
+
+    # Stop further UI so guest cannot see or interact with editing controls
+    st.stop()
 
 # === Subtraction UI (aligned: select, amount, button in one row) ===
 st.subheader("Subtract from the Expense allocations:")
@@ -928,6 +1045,11 @@ try:
         def save_log_note(tx_id):
             st.session_state.setdefault("busy", True)
             try:
+                # PERMISSION CHECK: read-only users cannot mutate
+                if str(st.session_state.get("username", "")).lower() == "guest":
+                    st.error("Permission denied: read-only user.")
+                    return
+
                 key = f"edit_note_{tx_id}"
                 note_val = st.session_state.get(key, "")
                 # Update the log document by tx (tx assumed unique)
