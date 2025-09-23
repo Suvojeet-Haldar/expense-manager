@@ -1193,4 +1193,4 @@ st.write(f"Last DB save timestamp (UTC, naive): {st.session_state.last_timestamp
 st.write("Note: display uses a cached render snapshot and applies increments since that snapshot. On successful subtraction or addition or edit the DB is updated atomically.")
 
 st.markdown("---")
-st.write("To migrate to MongoDB Atlas later, change the MONGO_URI at the top to your Atlas connection string.")
+# st.write("To migrate to MongoDB Atlas later, change the MONGO_URI at the top to your Atlas connection string.")
