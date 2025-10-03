@@ -1019,11 +1019,15 @@ try:
     cursor2 = col_logs.find().sort("timestamp", -1)
     logs_for_select = list(cursor2)
     if logs_for_select:
-        # options: show tx and a short label
-        select_options = [
-            (lg.get("tx", ""), f"#{lg.get("tx", "")} — { _to_ist_string(to_naive(lg.get('timestamp'))) } — {lg.get('var_name','')}")
-            for lg in logs_for_select
-        ]
+        # Build select_options safely (avoid nested quoting in f-strings)
+        select_options = []
+        for lg in logs_for_select:
+            tx_val = lg.get("tx", "")
+            ts_iso = _to_ist_string(to_naive(lg.get("timestamp")))
+            var_name = lg.get("var_name", "")
+            label = f"#{tx_val} — {ts_iso} — {var_name}"
+            select_options.append((tx_val, label))
+
         # build mapping and separate lists for selectbox
         tx_values = [opt[0] for opt in select_options]
         tx_labels = [opt[1] for opt in select_options]
