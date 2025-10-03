@@ -47,3 +47,5 @@ poetry.lock
 Pipfile.lock
 
 dump/
+live_vars_db.archive
+.gitignore

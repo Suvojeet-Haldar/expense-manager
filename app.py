@@ -595,6 +595,8 @@ st.session_state.setdefault("busy", False)
 st.session_state.setdefault("subtract_result", None)  # will hold dict {"ok":bool,"msg":str}
 # --- LOGS ADDED: store note in session_state default
 st.session_state.setdefault("subtract_note", "")
+# Generator for confirm-delete checkbox keys (ensures checkbox is recreated unchecked after deletion)
+st.session_state.setdefault("confirm_delete_gen", 0)
 # --- /LOGS ADDED
 
 # ---------- UI ----------
@@ -1019,7 +1021,7 @@ try:
     if logs_for_select:
         # options: show tx and a short label
         select_options = [
-            (lg.get("tx", ""), f"#{lg.get('tx', '')} — { _to_ist_string(to_naive(lg.get('timestamp'))) } — {lg.get('var_name','')}")
+            (lg.get("tx", ""), f"#{lg.get("tx", "")} — { _to_ist_string(to_naive(lg.get('timestamp'))) } — {lg.get('var_name','')}")
             for lg in logs_for_select
         ]
         # build mapping and separate lists for selectbox
@@ -1155,7 +1157,9 @@ if st.session_state.var_names:
     st.markdown("**Danger zone:** delete this allocation")
     del_col1, del_col2 = st.columns([3, 1])
     with del_col1:
-        confirm_delete = st.checkbox("I confirm I want to delete this allocation", key="confirm_delete")
+        # dynamic key so we can force recreation (unchecked) after successful deletion
+        confirm_key = f"confirm_delete_{st.session_state.get('confirm_delete_gen', 0)}"
+        confirm_delete = st.checkbox("I confirm I want to delete this allocation", key=confirm_key, value=False)
     with del_col2:
         def do_delete():
             st.session_state["busy"] = True
@@ -1163,15 +1167,21 @@ if st.session_state.var_names:
                 ok, msg = delete_allocation(edit_idx)
                 if ok:
                     st.success(msg)
-                    # reset confirm checkbox
-                    st.session_state.confirm_delete = False
+                    # increment the generator so the checkbox widget key changes and Streamlit recreates it unchecked
+                    st.session_state["confirm_delete_gen"] = st.session_state.get("confirm_delete_gen", 0) + 1
+                    # ensure busy is cleared before rerun so UI is consistent
+                    st.session_state["busy"] = False
+                    # force a rerun to update the UI immediately
+                    st.experimental_rerun()
                 else:
                     st.error(msg)
             except Exception as e:
                 st.error(f"Exception deleting allocation: {e}")
             finally:
+                # If we didn't rerun (e.g., deletion failed), ensure busy flag is cleared
                 st.session_state["busy"] = False
-        st.button("Delete", on_click=do_delete, disabled=(not st.session_state.get("confirm_delete", False) or st.session_state.get("busy", False)))
+        # disable based on the dynamic confirm key
+        st.button("Delete", on_click=do_delete, disabled=(not st.session_state.get(confirm_key, False) or st.session_state.get("busy", False)))
 else:
     st.info("No allocations available to edit.")
 
